@@ -24,7 +24,7 @@ class AnySwitch:
     RETURN_TYPES = ("BOOLEAN", ANY)
     RETURN_NAMES = ("是否启用优先", "输出结果")
     FUNCTION = "check"
-    CATEGORY = "chenxu/utils"
+    CATEGORY = "utils"
 
     @classmethod
     def VALIDATE_INPUTS(cls, input_types):
@@ -49,7 +49,7 @@ class AnyBooleanSwitch:
     RETURN_TYPES = (ANY,)
     RETURN_NAMES = ("输出结果",)
     FUNCTION = "process"
-    CATEGORY = "chenxu/utils"
+    CATEGORY = "utils"
 
     @classmethod
     def VALIDATE_INPUTS(cls, input_types):
