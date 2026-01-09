@@ -68,7 +68,7 @@ class AnyIsEmpty:
     def INPUT_TYPES(cls):
         return {
             "optional": {
-                "input_data": (ANY,),
+                "any": (ANY,),
             }
         }
 
@@ -78,18 +78,18 @@ class AnyIsEmpty:
     CATEGORY = "maoyu/utils"
 
     @classmethod
-    def VALIDATE_INPUTS(cls, input_types):
+    def VALIDATE_INPUTS(cls, any):
         return True
 
-    def check_empty(self, input_data=None):
+    def check_empty(self, any=None):
         # 1. 优先判断是否为 None
-        if input_data is None:
+        if any is None:
             return (True,)
         
         # 2. 尝试判断长度 (针对列表、字符串、字典等容器)
-        # 注意：不直接使用 if not input_data，因为这样会误判 0, False 等有效值
+        # 注意：不直接使用 if not any，因为这样会误判 0, False 等有效值
         try:
-            if hasattr(input_data, "__len__") and len(input_data) == 0:
+            if hasattr(any, "__len__") and len(any) == 0:
                 return (True,)
         except:
             # 如果获取长度出错（例如某些特殊的 tensor），则保守认为不为空
