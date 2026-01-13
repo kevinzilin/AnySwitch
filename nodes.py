@@ -61,7 +61,7 @@ class AnyBooleanSwitch:
         if 开关:
             return (输入,)
         else:
-            return (ExecutionBlocker(None),)
+            return (None,)
 
 class AnyIsEmpty:
     @classmethod
