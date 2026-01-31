@@ -3,10 +3,13 @@ import os
 import base64
 import io as pyio
 import uuid
+import re
 import requests
 import numpy as np
 from PIL import Image
 from comfy_api.latest import io
+
+MAX_SAFE_INT = 9007199254740991
 
 TYPE_OPTIONS_DISPLAY = ["文本","邮箱","数字","单选","多选","日期","复选框","人员","电话","链接","附件"]
 TYPE_ALIASES = {
@@ -668,6 +671,63 @@ class FeishuBitablePushNode:
                 return None
             return None
 
+        def _coerce_value(ftype, v):
+            try:
+                ft = (ftype or "text").strip().lower()
+                ft = TYPE_ALIASES.get(ft, ft)
+            except Exception:
+                ft = "text"
+            if ft == "number":
+                # 尝试把值转换成数值；字符串提取首个数字；列表取首个可转换项
+                def to_num(x):
+                    if isinstance(x, bool):
+                        return int(x)
+                    if isinstance(x, (int, float)):
+                        return x
+                    if isinstance(x, str):
+                        s = x.strip()
+                        if not s:
+                            return None
+                        s = s.replace(",", "")
+                        # 尝试直接转换；失败则用正则提取第一个数字片段
+                        try:
+                            if "." in s:
+                                return float(s)
+                            return int(s)
+                        except:
+                            m = re.search(r"[-+]?\d+(?:\.\d+)?", s)
+                            if m:
+                                try:
+                                    ss = m.group(0)
+                                    return float(ss) if "." in ss else int(ss)
+                                except:
+                                    return None
+                            return None
+                    return None
+                if isinstance(v, (list, tuple)):
+                    for x in v:
+                        nv = to_num(x)
+                        if nv is not None:
+                            return nv
+                    return None
+                return to_num(v)
+            elif ft == "checkbox":
+                # 复选框转换为布尔
+                if isinstance(v, bool):
+                    return v
+                if isinstance(v, (int, float)):
+                    return bool(int(v))
+                if isinstance(v, str):
+                    s = v.strip().lower()
+                    return s in ("1", "true", "yes", "y", "on", "是", "开")
+                return bool(v)
+            else:
+                # 其他类型一律转为字符串
+                try:
+                    return str(v)
+                except Exception:
+                    return ""
+
         extra_fields = config.get("bitable_fields", [])
         print(f"[FeishuBitable] extra_fields count={len(extra_fields)}")
         field_types = {}
@@ -865,19 +925,60 @@ class FeishuBitablePushNode:
                         except Exception:
                             fields[name] = str(value)
             else:
+                # 非附件/URL类型
+                ftype_current = field_types.get(name, "text")
                 if isinstance(value, list):
                     sep = "\n\n-----------\n\n"
                     parts = []
-                    for v in value:
-                        if _is_url_string(v):
-                            s = v.strip()
-                            if s:
-                                parts.append(s)
-                        elif is_image_like(v):
-                            try:
-                                if hasattr(v, "shape") and len(v.shape) == 4 and int(v.shape[0]) > 1:
-                                    for b in range(int(v.shape[0])):
-                                        ib = self._tensor_to_bytes(v[b:b+1])
+                    if TYPE_ALIASES.get(ftype_current, ftype_current) == "number":
+                        # 列表取首个可转换的数字
+                        num_val = None
+                        for v in value:
+                            nv = _coerce_value(ftype_current, v)
+                            if isinstance(nv, (int, float)):
+                                num_val = nv
+                                break
+                        if num_val is not None:
+                            if isinstance(num_val, int) and abs(num_val) > MAX_SAFE_INT:
+                                fallback_name = f"{name}文本"
+                                field_types[fallback_name] = "text"
+                                fields[fallback_name] = str(value[0] if len(value) > 0 else num_val)
+                                logs.append(f"Number overflow fallback to text: {fallback_name}")
+                            else:
+                                fields[name] = num_val
+                        else:
+                            logs.append(f"Number convert fail: {name}")
+                    else:
+                        for v in value:
+                            if _is_url_string(v):
+                                s = v.strip()
+                                if s:
+                                    parts.append(s)
+                            elif is_image_like(v):
+                                try:
+                                    if hasattr(v, "shape") and len(v.shape) == 4 and int(v.shape[0]) > 1:
+                                        for b in range(int(v.shape[0])):
+                                            ib = self._tensor_to_bytes(v[b:b+1])
+                                            if ib:
+                                                if bool(config.get("gitee_token")) and bool(config.get("gitee_owner")) and bool(config.get("gitee_repo")):
+                                                    u = self._upload_image_gitee(ib, config)
+                                                    if u:
+                                                        parts.append(u)
+                                                        logs.append(f"Uploaded: {u}")
+                                                    elif config.get("gitee_token"):
+                                                        logs.append("Gitee Upload Failed")
+                                                    if not u:
+                                                        du = self._image_bytes_to_data_url(ib)
+                                                        if du:
+                                                            parts.append(du)
+                                                            logs.append("Fallback: data-url")
+                                                else:
+                                                    du = self._image_bytes_to_data_url(ib)
+                                                    if du:
+                                                        parts.append(du)
+                                                        logs.append("Fallback: data-url")
+                                    else:
+                                        ib = _value_to_image_bytes(v)
                                         if ib:
                                             if bool(config.get("gitee_token")) and bool(config.get("gitee_owner")) and bool(config.get("gitee_repo")):
                                                 u = self._upload_image_gitee(ib, config)
@@ -896,37 +997,27 @@ class FeishuBitablePushNode:
                                                 if du:
                                                     parts.append(du)
                                                     logs.append("Fallback: data-url")
-                                else:
-                                    ib = _value_to_image_bytes(v)
-                                    if ib:
-                                        if bool(config.get("gitee_token")) and bool(config.get("gitee_owner")) and bool(config.get("gitee_repo")):
-                                            u = self._upload_image_gitee(ib, config)
-                                            if u:
-                                                parts.append(u)
-                                                logs.append(f"Uploaded: {u}")
-                                            elif config.get("gitee_token"):
-                                                logs.append("Gitee Upload Failed")
-                                            if not u:
-                                                du = self._image_bytes_to_data_url(ib)
-                                                if du:
-                                                    parts.append(du)
-                                                    logs.append("Fallback: data-url")
-                                        else:
-                                            du = self._image_bytes_to_data_url(ib)
-                                            if du:
-                                                parts.append(du)
-                                                logs.append("Fallback: data-url")
-                            except Exception:
+                                except Exception:
+                                    s = str(v)
+                                    if s.strip():
+                                        parts.append(s)
+                            else:
                                 s = str(v)
                                 if s.strip():
                                     parts.append(s)
-                        else:
-                            s = str(v)
-                            if s.strip():
-                                parts.append(s)
-                    fields[name] = sep.join(parts) if parts else ""
+                        fields[name] = sep.join(parts) if parts else ""
                 else:
-                    fields[name] = str(value)
+                    val = _coerce_value(ftype_current, value)
+                    if val is not None:
+                        if TYPE_ALIASES.get(ftype_current, ftype_current) == "number" and isinstance(val, int) and abs(val) > MAX_SAFE_INT:
+                            fallback_name = f"{name}文本"
+                            field_types[fallback_name] = "text"
+                            fields[fallback_name] = str(value)
+                            logs.append(f"Number overflow fallback to text: {fallback_name}")
+                        else:
+                            fields[name] = val
+                    else:
+                        logs.append(f"Value convert fail: {name}")
 
         items = config.get("bitable_items", [])
         print(f"[FeishuBitable] bitable_items count={len(items)}")
@@ -1005,7 +1096,20 @@ class FeishuBitablePushNode:
                             if tokens:
                                 fields_payload[target_name] = tokens
                         else:
-                            fields_payload[k] = v
+                            if v is not None:
+                                try:
+                                    ftk = field_types.get(k, "text")
+                                    ftk = TYPE_ALIASES.get(ftk, ftk)
+                                    if ftk == "number":
+                                        vn = _coerce_value(ftk, v)
+                                        if vn is None:
+                                            logs.append(f"Skip non-number value: {k}")
+                                            continue
+                                        fields_payload[k] = vn
+                                    else:
+                                        fields_payload[k] = v
+                                except Exception:
+                                    fields_payload[k] = v
                     else:
                         # 新列未存在但我们要写附件：自动创建后写入
                         if isinstance(v, list) and v and isinstance(v[0], (bytes, bytearray)) and field_types.get(k) == "attachment":
@@ -1054,7 +1158,19 @@ class FeishuBitablePushNode:
                                     pass
                                 name_to_id = client.list_fields_map(resolved_app_token, table_id)
                                 fields_info = client.list_fields_info(resolved_app_token, table_id)
-                                fields_payload[target_key] = v
+                                try:
+                                    ftk = field_types.get(k, "text")
+                                    ftk = TYPE_ALIASES.get(ftk, ftk)
+                                    if ftk == "number":
+                                        vn = _coerce_value(ftk, v)
+                                        if vn is None:
+                                            logs.append(f"Skip non-number value: {k}")
+                                        else:
+                                            fields_payload[target_key] = vn
+                                    else:
+                                        fields_payload[target_key] = v
+                                except Exception:
+                                    fields_payload[target_key] = v
                 print(f"[FeishuBitable] payload_by_name_filtered count={len(fields_payload)}")
             else:
                 fields_payload = fields

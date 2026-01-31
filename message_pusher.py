@@ -270,6 +270,9 @@ class MessagePushNode:
         try:
             if isinstance(any_source, (list, tuple)):
                 for idx, item in enumerate(any_source):
+                    if isinstance(item, bool):
+                        # 布尔值不拼接到文本
+                        continue
                     if is_image_like(item):
                         try:
                             if hasattr(item, "shape") and len(item.shape) == 4 and item.shape[0] > 1:
@@ -296,9 +299,10 @@ class MessagePushNode:
                     img_bytes = self._tensor_to_bytes(any_source)
                     image_bytes_list.append(img_bytes)
             else:
-                s = str(any_source)
-                if s.strip():
-                    text_parts.append(s)
+                if not isinstance(any_source, bool):
+                    s = str(any_source)
+                    if s.strip():
+                        text_parts.append(s)
         except Exception as e:
             logs.append(f"Process Error: {str(e)}")
 
