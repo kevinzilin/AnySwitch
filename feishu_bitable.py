@@ -535,16 +535,14 @@ class FeishuBitablePushNode:
                 outputs=[io.String.Output(display_name="写入日志")],
                 inputs=[
                     io.Custom("MESSAGE_CONFIG").Input("config"),
-                    io.String.Input("title", default="", placeholder="请输入标题内容"),
-                    io.String.Input("note", default="", multiline=True, placeholder="请输入备注内容"),
                 ],
             )
         @classmethod
-        def execute(cls, config, title: str, note: str) -> io.NodeOutput:
+        def execute(cls, config) -> io.NodeOutput:
             try:
                 print("[FeishuBitable] Execute begin")
                 node = FeishuBitablePushNode()
-                out = node.push_bitable(config, title, note)
+                out = node.push_bitable(config)
                 print("[FeishuBitable] Execute done")
                 return io.NodeOutput(*out)
             except Exception as e:
@@ -617,15 +615,9 @@ class FeishuBitablePushNode:
         except Exception:
             return None
 
-    def push_bitable(self, config, 标题, 备注):
+    def push_bitable(self, config):
         logs = []
-        # 构造初始字段（固定列名）
         fields = {}
-        # 固定字段名隐藏在 UI 内部
-        title_field = "标题"
-        note_field = "备注"
-        fields[title_field] = str(标题 or "")
-        fields[note_field] = str(备注 or "")
         try:
             has_app_id = bool((config.get("feishu_app_id") or "").strip())
             has_app_secret = bool((config.get("feishu_app_secret") or "").strip())
