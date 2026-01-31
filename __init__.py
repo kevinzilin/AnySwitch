@@ -31,12 +31,22 @@ except Exception as e:
     _message_nodes = {}
     _message_display_names = {}
 
+# 6. 多维表格 模块
+try:
+    from .feishu_bitable import NODE_CLASS_MAPPINGS as _bitable_nodes
+    from .feishu_bitable import NODE_DISPLAY_NAME_MAPPINGS as _bitable_display_names
+except Exception as e:
+    print(f"\033[33m[AnySwitch] Warning: Failed to load nodes from feishu_bitable.py. Error: {e}\033[0m")
+    _bitable_nodes = {}
+    _bitable_display_names = {}
+
 # === 汇总所有节点 ===
 NODE_CLASS_MAPPINGS = {}
 # 合并子模块的节点
 NODE_CLASS_MAPPINGS.update(_dir_nodes)
 NODE_CLASS_MAPPINGS.update(_gate_nodes)
 NODE_CLASS_MAPPINGS.update(_message_nodes)
+NODE_CLASS_MAPPINGS.update(_bitable_nodes)
 
 # 合并主模块的节点
 NODE_CLASS_MAPPINGS.update({
@@ -50,6 +60,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS.update(_dir_display_names)
 NODE_DISPLAY_NAME_MAPPINGS.update(_gate_display_names)
 NODE_DISPLAY_NAME_MAPPINGS.update(_message_display_names)
+NODE_DISPLAY_NAME_MAPPINGS.update(_bitable_display_names)
 # 合并主模块的显示名称
 NODE_DISPLAY_NAME_MAPPINGS.update({
     "AnySwitch": "万能判断切换 (Any Switch)",
