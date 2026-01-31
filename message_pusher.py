@@ -71,8 +71,6 @@ class FeishuConfigNode:
             "optional": {
                 "feishu_webhook": ("STRING", {"default": "", "multiline": False, "placeholder": "完整Webhook地址"}),
                 "feishu_secret": ("STRING", {"default": "", "multiline": False, "placeholder": "签名校验密钥(可选)"}),
-                "feishu_app_id": ("STRING", {"default": "", "multiline": False, "placeholder": "App ID (用于图片上传)"}),
-                "feishu_app_secret": ("STRING", {"default": "", "multiline": False, "placeholder": "App Secret (用于图片上传)"}),
                 "pre_config": ("MESSAGE_CONFIG",),
             }
         }
@@ -95,16 +93,12 @@ class FeishuConfigNode:
             item = {
                 "webhook": feishu_webhook.strip(),
                 "secret": feishu_secret.strip(),
-                "app_id": feishu_app_id.strip(),
-                "app_secret": feishu_app_secret.strip()
             }
             config["feishu_items"].append(item)
             
             # 兼容旧逻辑
             config["feishu_webhook"] = feishu_webhook.strip()
             config["feishu_secret"] = feishu_secret.strip()
-            config["feishu_app_id"] = feishu_app_id.strip()
-            config["feishu_app_secret"] = feishu_app_secret.strip()
             
         return (config,)
 
@@ -422,15 +416,11 @@ class MessagePushNode:
     def push_feishu_item(self, item_config, title, content, image_urls=None, image_bytes_list=None):
         webhook = item_config.get("webhook")
         secret = item_config.get("secret")
-        app_id = item_config.get("app_id")
-        app_secret = item_config.get("app_secret")
+        app_id = None
+        app_secret = None
         
         image_keys = []
-        can_native = (
-            app_id and app_secret and image_bytes_list 
-            and hasattr(self, "_get_feishu_access_token") 
-            and hasattr(self, "_upload_feishu_image")
-        )
+        can_native = False
         if can_native:
             try:
                 access_token = self._get_feishu_access_token(app_id, app_secret)
