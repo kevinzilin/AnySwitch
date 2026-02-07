@@ -33,8 +33,23 @@ class AnySwitch:
         return True
 
     def check(self, 优先输入=None, 备用输入=None):
-        # 如果优先输入不为空，则认为激活（使用优先输入）
-        is_active = 优先输入 is not None
+        # 调试打印，后续稳定后可删除
+        # print(f"DEBUG AnySwitch: 优先输入 type={type(优先输入)}, value={优先输入}")
+        
+        # 1. 基础判断：非 None 且非 ExecutionBlocker
+        is_active = 优先输入 is not None and not isinstance(优先输入, ExecutionBlocker)
+        
+        # 2. 增强判断：如果是 Latent 且全为 0，视为无效（通常是 Bypass 透传的空 Latent）
+        if is_active and isinstance(优先输入, dict) and 'samples' in 优先输入:
+            try:
+                samples = 优先输入['samples']
+                # 检查是否为 Tensor 且全为 0 (使用 .any() 判断是否存在非0值)
+                if hasattr(samples, 'any') and not samples.any():
+                    is_active = False
+                    print("DEBUG AnySwitch: 检测到全0 Latent，视为无效输入，切换至备用输入")
+            except Exception as e:
+                print(f"DEBUG AnySwitch: Latent 检查出错: {e}")
+
         output_data = 优先输入 if is_active else 备用输入
         return (is_active, output_data)
 
