@@ -8,6 +8,7 @@ import requests
 import numpy as np
 from PIL import Image
 from comfy_api.latest import io
+import folder_paths
 
 MAX_SAFE_INT = 9007199254740991
 
@@ -452,6 +453,89 @@ class FeishuBitableClient:
             print(f"[FeishuBitable] Upload attachment error: {e}")
         return None
 
+    def upload_file(self, app_token, file_bytes, filename=None):
+        if self._mock:
+            print("[FeishuBitable][MOCK] Upload file")
+            return "box_mock_token_file"
+        t = self.get_token()
+        if not t:
+            return None
+        if not filename:
+            filename = f"{uuid.uuid4().hex}.bin"
+        
+        file_size = len(file_bytes)
+        # 飞书建议超过 20MB 使用分片上传
+        # 这里强制使用分片上传，以避免 bitable_file 在 upload_all 接口下的潜在兼容性问题
+        # CHUNK_SIZE = 20 * 1024 * 1024 
+        
+        # 分片上传
+        print(f"[FeishuBitable] Start chunked upload for {filename} ({file_size} bytes)")
+        # 1. 预上传
+        try:
+            url_prepare = "https://open.feishu.cn/open-apis/drive/v1/medias/upload_prepare"
+            headers = {"Authorization": f"Bearer {t}", "Content-Type": "application/json"}
+            data_prepare = {
+                "file_name": filename,
+                "parent_type": "bitable_file",
+                "parent_node": app_token,
+                "size": file_size
+            }
+            res_prep = requests.post(url_prepare, headers=headers, json=data_prepare, timeout=30)
+            j_prep = res_prep.json()
+            if res_prep.status_code != 200 or j_prep.get("code") != 0:
+                print(f"[FeishuBitable] Upload prepare fail: {res_prep.text[:200]}")
+                return None
+            upload_id = j_prep.get("data", {}).get("upload_id")
+            block_size = j_prep.get("data", {}).get("block_size", 4 * 1024 * 1024) # 默认 4MB
+            block_num = j_prep.get("data", {}).get("block_num")
+            print(f"[FeishuBitable] Upload prepare OK: upload_id={upload_id} block_size={block_size} blocks={block_num}")
+            
+            # 2. 分片上传
+            url_part = "https://open.feishu.cn/open-apis/drive/v1/medias/upload_part"
+            
+            for i in range(block_num):
+                start = i * block_size
+                end = min((i + 1) * block_size, file_size)
+                chunk_data = file_bytes[start:end]
+                
+                # upload_part 是 form-data
+                # 字段: upload_id, seq (从0开始), size (分片大小), file (二进制)
+                files_part = {"file": (filename, chunk_data)}
+                data_part = {
+                    "upload_id": upload_id,
+                    "seq": str(i),
+                    "size": str(len(chunk_data))
+                }
+                headers_part = {"Authorization": f"Bearer {t}"} # multipart/form-data 不需要手动设置 Content-Type
+                
+                print(f"[FeishuBitable] Uploading part {i+1}/{block_num} ({len(chunk_data)} bytes)...")
+                res_part = requests.post(url_part, headers=headers_part, files=files_part, data=data_part, timeout=120)
+                j_part = res_part.json()
+                if res_part.status_code != 200 or j_part.get("code") != 0:
+                    print(f"[FeishuBitable] Upload part {i} fail: {res_part.text[:200]}")
+                    return None
+            
+            # 3. 完成上传
+            url_finish = "https://open.feishu.cn/open-apis/drive/v1/medias/upload_finish"
+            data_finish = {
+                "upload_id": upload_id,
+                "block_num": block_num
+            }
+            res_fin = requests.post(url_finish, headers=headers, json=data_finish, timeout=60)
+            j_fin = res_fin.json()
+            if res_fin.status_code == 200 and j_fin.get("code") == 0:
+                ft = j_fin.get("data", {}).get("file_token")
+                if ft:
+                    print(f"[FeishuBitable] Upload finish OK: {ft}")
+                    return ft
+            print(f"[FeishuBitable] Upload finish fail: {res_fin.text[:200]}")
+            return None
+            
+        except Exception as e:
+            print(f"[FeishuBitable] Chunked upload error: {e}")
+            return None
+
+
 class FeishuBitableConfigNode:
     CATEGORY = "maoyu/message"
     TITLE = "飞书表格配置 (Feishu Bitable Config)"
@@ -588,30 +672,38 @@ class FeishuBitablePushNode:
         image.save(buffered, format="PNG")
         return buffered.getvalue()
 
-    def _upload_image_gitee(self, image_bytes, config):
+    def _upload_file_gitee(self, file_bytes, filename, config):
         token = config.get("gitee_token")
         owner = config.get("gitee_owner")
         repo = config.get("gitee_repo")
-        path = config.get("gitee_path", "images")
+        path = config.get("gitee_path", "files")
         branch = config.get("gitee_branch", "master")
         if not (token and owner and repo):
             return None
         try:
-            filename = f"{uuid.uuid4().hex}.png"
             path = path.strip("/")
             full_path = f"{path}/{filename}" if path else filename
             url = f"https://gitee.com/api/v5/repos/{owner}/{repo}/contents/{full_path}"
-            content_base64 = base64.b64encode(image_bytes).decode('utf-8')
+            content_base64 = base64.b64encode(file_bytes).decode('utf-8')
             data = {"access_token": token, "content": content_base64, "message": f"upload: {filename}", "branch": branch}
-            res = requests.post(url, data=data, timeout=30)
+            res = requests.post(url, data=data, timeout=60)
             j = res.json()
             if res.status_code == 201:
                 return j.get("content", {}).get("download_url")
-        except Exception:
-            return None
+            print(f"[FeishuBitable] Gitee upload fail: {res.status_code} {res.text[:200]}")
+        except Exception as e:
+            print(f"[FeishuBitable] Gitee upload error: {e}")
         return None
+
+    def _upload_image_gitee(self, image_bytes, config):
+        filename = f"{uuid.uuid4().hex}.png"
+        cfg = config.copy()
+        if not cfg.get("gitee_path"):
+            cfg["gitee_path"] = "images"
+        return self._upload_file_gitee(image_bytes, filename, cfg)
     
     def _image_bytes_to_data_url(self, image_bytes):
+
         try:
             b64 = base64.b64encode(image_bytes).decode("utf-8")
             return f"data:image/png;base64,{b64}"
@@ -619,6 +711,11 @@ class FeishuBitablePushNode:
             return None
 
     def push_bitable(self, config):
+        class MediaItem:
+            def __init__(self, data, filename):
+                self.data = data
+                self.filename = filename
+
         logs = []
         fields = {}
         try:
@@ -643,6 +740,15 @@ class FeishuBitablePushNode:
                 if isinstance(s, str):
                     st = s.strip().lower()
                     return st.startswith("http://") or st.startswith("https://")
+            except Exception:
+                pass
+            return False
+
+        def _is_video_file(v):
+            try:
+                if isinstance(v, str):
+                    exts = (".mp4", ".mov", ".avi", ".mkv", ".webm")
+                    return v.lower().endswith(exts)
             except Exception:
                 pass
             return False
@@ -743,6 +849,7 @@ class FeishuBitablePushNode:
             value = f.get("value")
             if not name:
                 continue
+            
             field_types[name] = ftype
             if ftype in ("attachment", "url"):
                 has_gitee = bool(config.get("gitee_token")) and bool(config.get("gitee_owner")) and bool(config.get("gitee_repo"))
@@ -752,6 +859,78 @@ class FeishuBitablePushNode:
                     for v in value:
                         if _is_url_string(v):
                             urls.append(v.strip())
+                        elif isinstance(v, str) and os.path.exists(v) and os.path.isfile(v):
+                            # 本地文件：优先作为文件处理，保留文件名，使用 upload_file 接口
+                            try:
+                                with open(v, "rb") as f:
+                                    vb = f.read()
+                                fname = os.path.basename(v)
+                                if ftype == "attachment":
+                                    attachments.append(MediaItem(vb, fname))
+                                elif has_gitee:
+                                    u = self._upload_file_gitee(vb, fname, config)
+                                    if u:
+                                        urls.append(u)
+                                        logs.append(f"Uploaded: {u}")
+                                    else:
+                                        logs.append("Gitee Upload Failed")
+                                else:
+                                    # URL 类型且无 Gitee，如果是视频/文件，回退到附件
+                                    if _is_video_file(v):
+                                        attachments.append(MediaItem(vb, fname))
+                                        logs.append("Video fallback to attachment")
+                                    else:
+                                        # 图片文件且无 Gitee，转为 data-url
+                                        du = self._image_bytes_to_data_url(vb)
+                                        if du:
+                                            urls.append(du)
+                                            logs.append("Fallback: data-url")
+                            except Exception as e:
+                                logs.append(f"File read error: {e}")
+                        # 兼容 ComfyUI LoadVideo/VHS 等节点的输出，可能是 dict 且包含 'filename' 或 'video_path'
+                        elif isinstance(v, dict) and ("filename" in v or "video_path" in v):
+                            try:
+                                v_path = v.get("video_path") or v.get("filename")
+                                v_sub = v.get("subfolder", "")
+                                v_type = v.get("type", "input")
+                                
+                                # 处理相对路径：尝试拼接 ComfyUI 目录
+                                real_path = v_path
+                                if v_path and not os.path.isabs(v_path):
+                                    real_path = folder_paths.get_annotated_filepath(v_path, v_sub) if hasattr(folder_paths, 'get_annotated_filepath') else None
+                                    if not real_path:
+                                         # Fallback
+                                         base = folder_paths.get_input_directory() if v_type == "input" else folder_paths.get_output_directory()
+                                         if v_sub:
+                                             base = os.path.join(base, v_sub)
+                                         real_path = os.path.join(base, v_path)
+                                
+                                if real_path and os.path.exists(real_path) and os.path.isfile(real_path):
+                                     with open(real_path, "rb") as f:
+                                        vb = f.read()
+                                     fname = os.path.basename(real_path)
+                                     if ftype == "attachment":
+                                         attachments.append(MediaItem(vb, fname))
+                                     elif has_gitee:
+                                         u = self._upload_file_gitee(vb, fname, config)
+                                         if u:
+                                             urls.append(u)
+                                             logs.append(f"Uploaded: {u}")
+                                         else:
+                                             logs.append("Gitee Upload Failed")
+                                     else:
+                                         if _is_video_file(real_path):
+                                             attachments.append(MediaItem(vb, fname))
+                                             logs.append("Video fallback to attachment")
+                                         else:
+                                             du = self._image_bytes_to_data_url(vb)
+                                             if du:
+                                                 urls.append(du)
+                                                 logs.append("Fallback: data-url")
+                                else:
+                                    logs.append(f"Video file not found: {v_path}")
+                            except Exception as e:
+                                logs.append(f"Video dict read error: {e}")
                         else:
                             try:
                                 if is_image_like(v) and hasattr(v, "shape") and len(v.shape) == 4 and int(v.shape[0]) > 1:
@@ -835,6 +1014,207 @@ class FeishuBitablePushNode:
                 else:
                     if _is_url_string(value):
                         fields[name] = value.strip()
+                    elif isinstance(value, str) and os.path.exists(value) and os.path.isfile(value):
+                        # 本地文件：优先作为文件处理
+                        try:
+                            with open(value, "rb") as f:
+                                vb = f.read()
+                            fname = os.path.basename(value)
+                            if ftype == "attachment":
+                                fields[name] = [MediaItem(vb, fname)]
+                            elif has_gitee:
+                                u = self._upload_file_gitee(vb, fname, config)
+                                if u:
+                                    fields[name] = u
+                                    logs.append(f"Uploaded: {u}")
+                                else:
+                                    logs.append("Gitee Upload Failed")
+                            else:
+                                if ftype == "url":
+                                    # URL 且无 Gitee，视频回退到附件，图片转 data-url
+                                    if _is_video_file(value):
+                                        fallback_name = f"{name}附件"
+                                        field_types[fallback_name] = "attachment"
+                                        fields[fallback_name] = [MediaItem(vb, fname)]
+                                        logs.append(f"Video URL fallback to attachment: {fallback_name}")
+                                    else:
+                                        du = self._image_bytes_to_data_url(vb)
+                                        if du:
+                                            fields[name] = du
+                                            logs.append("Fallback: data-url")
+                        except Exception as e:
+                            logs.append(f"File read error: {e}")
+                    # 兼容 ComfyUI LoadVideo/VHS 等节点的输出，可能是 dict 且包含 'filename' 或 'video_path'
+                    elif isinstance(value, dict) and ("filename" in value or "video_path" in value):
+                         try:
+                             v_path = value.get("video_path") or value.get("filename")
+                             v_sub = value.get("subfolder", "")
+                             v_type = value.get("type", "input")
+                             
+                             # 处理相对路径：尝试拼接 ComfyUI 目录
+                             real_path = v_path
+                             if v_path and not os.path.isabs(v_path):
+                                 real_path = folder_paths.get_annotated_filepath(v_path, v_sub) if hasattr(folder_paths, 'get_annotated_filepath') else None
+                                 if not real_path:
+                                      # Fallback
+                                      base = folder_paths.get_input_directory() if v_type == "input" else folder_paths.get_output_directory()
+                                      if v_sub:
+                                          base = os.path.join(base, v_sub)
+                                      real_path = os.path.join(base, v_path)
+                             
+                             if real_path and os.path.exists(real_path) and os.path.isfile(real_path):
+                                  with open(real_path, "rb") as f:
+                                     vb = f.read()
+                                  fname = os.path.basename(real_path)
+                                  if ftype == "attachment":
+                                      fields[name] = [MediaItem(vb, fname)]
+                                  elif has_gitee:
+                                      u = self._upload_file_gitee(vb, fname, config)
+                                      if u:
+                                          fields[name] = u
+                                          logs.append(f"Uploaded: {u}")
+                                      else:
+                                          logs.append("Gitee Upload Failed")
+                                  else:
+                                      if ftype == "url":
+                                          if _is_video_file(real_path):
+                                              fallback_name = f"{name}附件"
+                                              field_types[fallback_name] = "attachment"
+                                              fields[fallback_name] = [MediaItem(vb, fname)]
+                                              logs.append(f"Video URL fallback to attachment: {fallback_name}")
+                                          else:
+                                              du = self._image_bytes_to_data_url(vb)
+                                              if du:
+                                                  fields[name] = du
+                                                  logs.append("Fallback: data-url")
+                             else:
+                                 logs.append(f"Video file not found: {v_path}")
+                         except Exception as e:
+                             logs.append(f"Video dict read error: {e}")
+                    # 兼容 ComfyUI VideoInput 对象 (如 VideoFromFile, VideoFromComponents)
+                    elif hasattr(value, "get_stream_source"):
+                        try:
+                            source = value.get_stream_source()
+                            
+                            if isinstance(source, str):
+                                # 返回的是文件路径
+                                v_path = source
+                                # 处理相对路径
+                                real_path = v_path
+                                if v_path and not os.path.isabs(v_path):
+                                    real_path = folder_paths.get_annotated_filepath(v_path) if hasattr(folder_paths, 'get_annotated_filepath') else None
+                                    if not real_path:
+                                        # Fallback
+                                        base = folder_paths.get_input_directory()
+                                        real_path = os.path.join(base, v_path)
+                                
+                                if real_path and os.path.exists(real_path) and os.path.isfile(real_path):
+                                    with open(real_path, "rb") as f:
+                                        vb = f.read()
+                                    fname = os.path.basename(real_path)
+                                    if ftype == "attachment":
+                                        fields[name] = [MediaItem(vb, fname)]
+                                    elif has_gitee:
+                                        u = self._upload_file_gitee(vb, fname, config)
+                                        if u:
+                                            fields[name] = u
+                                            logs.append(f"Uploaded: {u}")
+                                        else:
+                                            logs.append("Gitee Upload Failed")
+                                    else:
+                                        if ftype == "url":
+                                            if _is_video_file(real_path):
+                                                fallback_name = f"{name}附件"
+                                                field_types[fallback_name] = "attachment"
+                                                fields[fallback_name] = [MediaItem(vb, fname)]
+                                                logs.append(f"Video URL fallback to attachment: {fallback_name}")
+                                            else:
+                                                du = self._image_bytes_to_data_url(vb)
+                                                if du:
+                                                    fields[name] = du
+                                                    logs.append("Fallback: data-url")
+                                else:
+                                    logs.append(f"Video file not found: {v_path}")
+                            
+                            else:
+                                # 返回的是 BytesIO 或类似对象 (例如 VideoFromComponents)
+                                if hasattr(source, "getvalue"):
+                                    vb = source.getvalue()
+                                else:
+                                    source.seek(0)
+                                    vb = source.read()
+                                
+                                # 默认为 mp4，因为我们无法轻易得知具体格式，除非解析 container header
+                                fname = f"video_{uuid.uuid4().hex}.mp4"
+                                
+                                if ftype == "attachment":
+                                    fields[name] = [MediaItem(vb, fname)]
+                                elif has_gitee:
+                                    u = self._upload_file_gitee(vb, fname, config)
+                                    if u:
+                                        fields[name] = u
+                                        logs.append(f"Uploaded: {u}")
+                                    else:
+                                        logs.append("Gitee Upload Failed")
+                                else:
+                                    if ftype == "url":
+                                        # 既然是流数据，我们假设它是视频
+                                        fallback_name = f"{name}附件"
+                                        field_types[fallback_name] = "attachment"
+                                        fields[fallback_name] = [MediaItem(vb, fname)]
+                                        logs.append(f"Video stream fallback to attachment: {fallback_name}")
+                                        
+                        except Exception as e:
+                            logs.append(f"Video object read error: {e}")
+                    
+                    # 兼容 ComfyUI 对象类型 (旧版兼容，或无 get_stream_source)
+                    elif hasattr(value, "file_path") or hasattr(value, "path") or hasattr(value, "filename"):
+                        try:
+                            # 优先尝试获取 file_path (ComfyUI VideoFromFile 的真实属性)，其次 path/filename
+                            v_path = getattr(value, "file_path", None) or getattr(value, "path", None) or getattr(value, "filename", None)
+                            v_sub = getattr(value, "subfolder", "")
+                            v_type = getattr(value, "type", "input")
+                            
+                            # 处理相对路径：尝试拼接 ComfyUI 目录
+                            real_path = v_path
+                            if v_path and not os.path.isabs(v_path):
+                                real_path = folder_paths.get_annotated_filepath(v_path, v_sub) if hasattr(folder_paths, 'get_annotated_filepath') else None
+                                if not real_path:
+                                    # Fallback
+                                    base = folder_paths.get_input_directory() if v_type == "input" else folder_paths.get_output_directory()
+                                    if v_sub:
+                                        base = os.path.join(base, v_sub)
+                                    real_path = os.path.join(base, v_path)
+                            
+                            if real_path and os.path.exists(real_path) and os.path.isfile(real_path):
+                                with open(real_path, "rb") as f:
+                                    vb = f.read()
+                                fname = os.path.basename(real_path)
+                                if ftype == "attachment":
+                                    fields[name] = [MediaItem(vb, fname)]
+                                elif has_gitee:
+                                    u = self._upload_file_gitee(vb, fname, config)
+                                    if u:
+                                        fields[name] = u
+                                        logs.append(f"Uploaded: {u}")
+                                    else:
+                                        logs.append("Gitee Upload Failed")
+                                else:
+                                    if ftype == "url":
+                                        if _is_video_file(real_path):
+                                            fallback_name = f"{name}附件"
+                                            field_types[fallback_name] = "attachment"
+                                            fields[fallback_name] = [MediaItem(vb, fname)]
+                                            logs.append(f"Video URL fallback to attachment: {fallback_name}")
+                                        else:
+                                            du = self._image_bytes_to_data_url(vb)
+                                            if du:
+                                                fields[name] = du
+                                                logs.append("Fallback: data-url")
+                            else:
+                                logs.append(f"Video object file not found: {v_path}")
+                        except Exception as e:
+                            logs.append(f"Video object read error: {e}")
                     else:
                         try:
                             if is_image_like(value) and hasattr(value, "shape") and len(value.shape) == 4 and int(value.shape[0]) > 1:
@@ -1058,11 +1438,14 @@ class FeishuBitablePushNode:
             if name_to_id:
                 for k, v in fields.items():
                     if k in name_to_id:
-                        if isinstance(v, list) and v and isinstance(v[0], (bytes, bytearray)) and field_types.get(k) == "attachment":
+                        if isinstance(v, list) and v and (isinstance(v[0], (bytes, bytearray)) or isinstance(v[0], MediaItem)) and field_types.get(k) == "attachment":
                             tokens = []
                             for idx, ib in enumerate(v):
                                 try:
-                                    ftok = client.upload_attachment(resolved_app_token, ib, f"image_{uuid.uuid4().hex}.png")
+                                    if isinstance(ib, MediaItem):
+                                        ftok = client.upload_file(resolved_app_token, ib.data, ib.filename)
+                                    else:
+                                        ftok = client.upload_attachment(resolved_app_token, ib, f"image_{uuid.uuid4().hex}.png")
                                     if ftok:
                                         tokens.append({"file_token": ftok})
                                         logs.append(f"Attachment Uploaded: {ftok}")
@@ -1112,7 +1495,7 @@ class FeishuBitablePushNode:
                                     fields_payload[k] = v
                     else:
                         # 新列未存在但我们要写附件：自动创建后写入
-                        if isinstance(v, list) and v and isinstance(v[0], (bytes, bytearray)) and field_types.get(k) == "attachment":
+                        if isinstance(v, list) and v and (isinstance(v[0], (bytes, bytearray)) or isinstance(v[0], MediaItem)) and field_types.get(k) == "attachment":
                             sc, st = client.create_field(resolved_app_token, table_id, k, "attachment")
                             logs.append(f"Auto Create Attachment Field[{k}]: {sc}")
                             target_key = k
@@ -1132,7 +1515,10 @@ class FeishuBitablePushNode:
                                 tokens = []
                                 for ib in v:
                                     try:
-                                        ftok = client.upload_attachment(resolved_app_token, ib, f"image_{uuid.uuid4().hex}.png")
+                                        if isinstance(ib, MediaItem):
+                                            ftok = client.upload_file(resolved_app_token, ib.data, ib.filename)
+                                        else:
+                                            ftok = client.upload_attachment(resolved_app_token, ib, f"image_{uuid.uuid4().hex}.png")
                                         if ftok:
                                             tokens.append({"file_token": ftok})
                                             logs.append(f"Attachment Uploaded: {ftok}")
@@ -1186,6 +1572,14 @@ class FeishuBitablePushNode:
                     else:
                         rp[k] = v
                 return rp
+            try:
+                print(f"[FeishuBitable] Sending create_record. Fields keys: {list(fields_payload.keys())}")
+                # 序列化检查
+                json_body = json.dumps({"fields": fields_payload})
+                # print(f"[FeishuBitable] Payload preview: {json_body[:500]}")
+            except Exception as e:
+                print(f"[FeishuBitable] Payload serialization error: {e}")
+            
             try:
                 http_status, text = client.create_record(resolved_app_token, table_id, fields_payload, v_id if (v_id or "").strip() else None)
             except Exception as e:
