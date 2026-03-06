@@ -413,6 +413,50 @@ class FeishuBitableClient:
         print(f"[FeishuBitable] Create record status={res.status_code} body={res.text[:200]}")
         return res.status_code, res.text
 
+    def update_record(self, app_token, table_id, record_id, fields):
+        if self._mock:
+            print(f"[FeishuBitable][MOCK] Update record: table_id={table_id} record_id={record_id}")
+            return 200, json.dumps({"code": 0, "data": {"record_id": record_id}})
+        headers = self.headers()
+        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/{record_id}"
+        body = {"fields": fields}
+        print(f"[FeishuBitable] Update record: table_id={table_id} record_id={record_id} fields_count={len(fields)}")
+        res = requests.put(url, json=body, headers=headers, timeout=30)
+        print(f"[FeishuBitable] Update record status={res.status_code} body={res.text[:200]}")
+        return res.status_code, res.text
+
+    def list_records(self, app_token, table_id, view_id=None, page_size=20, page_token=None, filter=None):
+        if self._mock:
+            print(f"[FeishuBitable][MOCK] List records: table_id={table_id} filter={filter}")
+            return {"items": [{"record_id": "rec_mock_1"}, {"record_id": "rec_mock_2"}], "total": 2, "has_more": False}
+        headers = self.headers()
+        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records"
+        params = {"page_size": page_size}
+        if view_id:
+            params["view_id"] = view_id
+        if page_token:
+            params["page_token"] = page_token
+        if filter:
+            params["filter"] = filter
+        
+        try:
+            res = requests.get(url, headers=headers, params=params, timeout=20)
+            if res.status_code == 200:
+                j = res.json()
+                if j.get("code") == 0:
+                    data = j.get("data", {})
+                    return {
+                        "items": data.get("items", []),
+                        "total": data.get("total", 0),
+                        "has_more": data.get("has_more", False),
+                        "page_token": data.get("page_token", "")
+                    }
+            print(f"[FeishuBitable] List records failed: {res.status_code} {res.text[:200]}")
+        except Exception as e:
+            print(f"[FeishuBitable] List records error: {e}")
+        return None
+
+
     def batch_create_records(self, app_token, table_id, records, view_id=None):
         if self._mock:
             print(f"[FeishuBitable][MOCK] Batch create: table_id={table_id} count={len(records)}")
@@ -547,12 +591,12 @@ class FeishuBitableConfigNode:
                 display_name="Feishu Bitable 配置",
                 category="maoyu/message",
                 inputs=[
+                    io.Custom("MESSAGE_CONFIG").Input("pre_config", optional=True),
                     io.String.Input("app_token", default="", tooltip="飞书多维表格 App Token"),
                     io.String.Input("table_id", default="", tooltip="数据表 ID"),
                     io.String.Input("view_id", default="", tooltip="视图 ID（可选）"),
                     io.String.Input("feishu_app_id", default="", tooltip="飞书应用 App ID（用于鉴权）", optional=True),
                     io.String.Input("feishu_app_secret", default="", tooltip="飞书应用 App Secret（用于鉴权）", optional=True),
-                    io.Custom("MESSAGE_CONFIG").Input("pre_config", optional=True),
                 ],
                 outputs=[io.Custom("MESSAGE_CONFIG").Output(display_name="配置信息")],
             )
@@ -561,16 +605,81 @@ class FeishuBitableConfigNode:
             config = pre_config.copy() if pre_config else {}
             if "bitable_items" not in config:
                 config["bitable_items"] = []
-            if app_token.strip() and table_id.strip():
-                config["bitable_items"].append({
-                    "app_token": app_token.strip(),
-                    "table_id": table_id.strip(),
-                    "view_id": view_id.strip()
-                })
+            
+            # 如果上游已经有 Record 节点生成的“空配置项”（只有 action 等），则合并进去
+            # 否则创建一个新的配置项
+            target_item = None
+            if config["bitable_items"]:
+                # 寻找最后一个还没有 app_token 的项
+                for item in reversed(config["bitable_items"]):
+                    if not item.get("app_token"):
+                        target_item = item
+                        break
+            
+            if target_item is None:
+                target_item = {}
+                config["bitable_items"].append(target_item)
+            
+            if app_token.strip():
+                target_item["app_token"] = app_token.strip()
+            if table_id.strip():
+                target_item["table_id"] = table_id.strip()
+            if view_id.strip():
+                target_item["view_id"] = view_id.strip()
+            
             if feishu_app_id.strip():
                 config["feishu_app_id"] = feishu_app_id.strip()
             if feishu_app_secret.strip():
                 config["feishu_app_secret"] = feishu_app_secret.strip()
+            return io.NodeOutput(config)
+
+class FeishuBitableRecordNode:
+    CATEGORY = "maoyu/message"
+    TITLE = "表格行操作 (Bitable Record)"
+    class Comfy(io.ComfyNode):
+        @classmethod
+        def define_schema(cls):
+            return io.Schema(
+                node_id="FeishuBitableRecordNode",
+                display_name="Feishu Bitable 行操作",
+                category="maoyu/message",
+                inputs=[
+                    io.Custom("MESSAGE_CONFIG").Input("pre_config", optional=True),
+                    io.Combo.Input("action", options=[
+                        "更新指定行 (Update Row)",
+                        "匹配字段更新 (Match Field)"
+                    ], default="更新指定行 (Update Row)", tooltip="操作模式"),
+                    io.Int.Input("record_index", default=0, tooltip="行号 (1开始)，仅在更新指定行模式下有效"),
+                    io.String.Input("match_field", default="标题", tooltip="匹配字段名，仅在匹配字段更新模式下有效"),
+                    io.String.Input("match_value", default="", tooltip="匹配字段值，仅在匹配字段更新模式下有效"),
+                ],
+                outputs=[io.Custom("MESSAGE_CONFIG").Output(display_name="配置信息")],
+            )
+        @classmethod
+        def execute(cls, action: str, record_index: int, match_field: str, match_value: str, pre_config=None) -> io.NodeOutput:
+            config = pre_config.copy() if pre_config else {}
+            if "bitable_items" not in config:
+                config["bitable_items"] = []
+            
+            # 如果没有配置项，创建一个空的（虽然通常应该接在 Config 节点后面）
+            if not config["bitable_items"]:
+                config["bitable_items"].append({})
+            
+            # 修改最后一个配置项
+            item = config["bitable_items"][-1]
+            
+            if "Update Row" in action:
+                item["record_action"] = "update_index"
+                item["record_index"] = record_index
+            elif "Match Field" in action:
+                item["record_action"] = "update_match"
+                item["match_field"] = match_field
+                item["match_value"] = match_value
+            else:
+                # 兼容旧逻辑或异常情况，默认为 append
+                # 但既然界面上移除了 append，理论上走不到这里，除非有旧工作流
+                item["record_action"] = "append"
+            
             return io.NodeOutput(config)
 
 class FeishuBitableFieldNode:
@@ -584,12 +693,12 @@ class FeishuBitableFieldNode:
                 display_name="Feishu Bitable 字段",
                 category="maoyu/message",
                 inputs=[
+                    io.Custom("MESSAGE_CONFIG").Input("pre_config", optional=True),
                     io.String.Input("field_name", default="标题", tooltip="多维表格列名"),
                     io.AnyType.Input("field_value", optional=True),
                     io.Combo.Input("field_type", options=[
                         *TYPE_OPTIONS_DISPLAY
                     ], default="文本", tooltip="字段类型"),
-                    io.Custom("MESSAGE_CONFIG").Input("pre_config", optional=True),
                 ],
                 outputs=[io.Custom("MESSAGE_CONFIG").Output(display_name="配置信息")],
             )
@@ -1402,7 +1511,7 @@ class FeishuBitablePushNode:
         items = config.get("bitable_items", [])
         print(f"[FeishuBitable] bitable_items count={len(items)}")
 
-        def push_one(app_token, table_id, v_id):
+        def push_one(app_token, table_id, v_id, record_idx=0, record_action="append", match_field=None, match_value=None):
             client = FeishuBitableClient(config.get("feishu_app_id"), config.get("feishu_app_secret"))
             resolved_app_token = client.resolve_app_token(app_token, table_id)
             if resolved_app_token != app_token:
@@ -1572,8 +1681,62 @@ class FeishuBitablePushNode:
                     else:
                         rp[k] = v
                 return rp
+            target_record_id = None
+            should_update = False
+            
+            if record_action == "update_index" and record_idx > 0:
+                print(f"[FeishuBitable] Attempting update for row {record_idx}")
+                # 查找指定行号的 record_id
+                # 分页查找，每页 100 条
+                curr_idx = 0
+                pg_token = None
+                while True:
+                    recs = client.list_records(resolved_app_token, table_id, v_id if (v_id or "").strip() else None, 100, pg_token)
+                    if not recs:
+                        break
+                    items_list = recs.get("items", [])
+                    if not items_list:
+                        break
+                    
+                    if curr_idx + len(items_list) >= record_idx:
+                        # 找到了
+                        offset = record_idx - curr_idx - 1
+                        if 0 <= offset < len(items_list):
+                            target_record_id = items_list[offset].get("record_id")
+                        break
+                    
+                    curr_idx += len(items_list)
+                    if not recs.get("has_more"):
+                        break
+                    pg_token = recs.get("page_token")
+                
+                if target_record_id:
+                    should_update = True
+                    logs.append(f"Found record[{record_idx}]: {target_record_id}")
+                else:
+                    logs.append(f"Record[{record_idx}] not found, skip update")
+                    print(f"[FeishuBitable] Record index {record_idx} not found")
+                    return
+            elif record_action == "update_match" and match_field:
+                print(f"[FeishuBitable] Attempting match update: {match_field} = {match_value}")
+                # 使用 filter 查找
+                # 构造 filter string: CurrentValue.[Field] = "Value"
+                # 注意 value 需要转义双引号
+                safe_val = str(match_value or "").replace('"', '\\"')
+                filter_str = f'CurrentValue.[{match_field}] = "{safe_val}"'
+                
+                recs = client.list_records(resolved_app_token, table_id, v_id if (v_id or "").strip() else None, 20, None, filter=filter_str)
+                if recs and recs.get("items"):
+                    items_list = recs.get("items")
+                    target_record_id = items_list[0].get("record_id")
+                    should_update = True
+                    logs.append(f"Match found: {target_record_id}")
+                else:
+                    logs.append(f"Match not found, append new")
+
+
             try:
-                print(f"[FeishuBitable] Sending create_record. Fields keys: {list(fields_payload.keys())}")
+                print(f"[FeishuBitable] Sending {'update' if should_update else 'create'}_record. Fields keys: {list(fields_payload.keys())}")
                 # 序列化检查
                 json_body = json.dumps({"fields": fields_payload})
                 # print(f"[FeishuBitable] Payload preview: {json_body[:500]}")
@@ -1581,9 +1744,12 @@ class FeishuBitablePushNode:
                 print(f"[FeishuBitable] Payload serialization error: {e}")
             
             try:
-                http_status, text = client.create_record(resolved_app_token, table_id, fields_payload, v_id if (v_id or "").strip() else None)
+                if should_update:
+                    http_status, text = client.update_record(resolved_app_token, table_id, target_record_id, fields_payload)
+                else:
+                    http_status, text = client.create_record(resolved_app_token, table_id, fields_payload, v_id if (v_id or "").strip() else None)
             except Exception as e:
-                logs.append(f"Create record error: {str(e)}")
+                logs.append(f"{'Update' if should_update else 'Create'} record error: {str(e)}")
                 http_status, text = 0, str(e)
             success = False
             need_retry_rich = False
@@ -1599,9 +1765,12 @@ class FeishuBitablePushNode:
             if (not success) and need_retry_rich:
                 rich_payload = _to_rich_payload(fields_payload)
                 try:
-                    http_status, text = client.create_record(resolved_app_token, table_id, rich_payload, v_id if (v_id or "").strip() else None)
+                    if should_update:
+                        http_status, text = client.update_record(resolved_app_token, table_id, target_record_id, rich_payload)
+                    else:
+                        http_status, text = client.create_record(resolved_app_token, table_id, rich_payload, v_id if (v_id or "").strip() else None)
                 except Exception as e:
-                    logs.append(f"Create record retry error: {str(e)}")
+                    logs.append(f"{'Update' if should_update else 'Create'} record retry error: {str(e)}")
                     http_status, text = 0, str(e)
                 try:
                     j = json.loads(text)
@@ -1617,7 +1786,29 @@ class FeishuBitablePushNode:
 
         if items:
             for it in items:
-                push_one(it.get("app_token", ""), it.get("table_id", ""), it.get("view_id", ""))
+                # 兼容 record_index 可能是 None 或空
+                ridx = 0
+                raction = it.get("record_action", "append")
+                try:
+                    ridx = int(it.get("record_index") or 0)
+                except:
+                    ridx = 0
+                
+                # 兼容旧配置：如果直接在 config 里写了 record_index 但没有 action
+                if ridx > 0 and raction == "append" and "record_action" not in it:
+                     # 此时可能是旧的配置节点传递过来的（虽然旧配置节点已经移除了 record_index，但为了向后兼容逻辑）
+                     # 或者用户通过其他方式注入了 record_index
+                     # 但由于我们从 ConfigNode 移除了 record_index，这里主要是为了健壮性
+                     # 如果 bitable_items 里有 record_index 且 > 0，那应该是 update_index
+                     raction = "update_index"
+                
+                app_token_val = it.get("app_token", "")
+                table_id_val = it.get("table_id", "")
+                if not (app_token_val and table_id_val):
+                     logs.append(f"Skip item: missing token/table")
+                     continue
+
+                push_one(app_token_val, table_id_val, it.get("view_id", ""), ridx, raction, it.get("match_field"), it.get("match_value"))
         else:
             # 兼容老参数：当未使用配置节点时，允许直接填写
             app_token = config.get("bitable_app_token", "") or ""
@@ -1626,19 +1817,21 @@ class FeishuBitablePushNode:
                 logs.append("No Bitable target in config")
                 print("[FeishuBitable] No Bitable target in config")
             else:
-                push_one(app_token, table_id, "")
+                push_one(app_token, table_id, "", 0, "append", None, None)
 
         return (" | ".join(logs),)
 
 NODE_CLASS_MAPPINGS = {
     "FeishuBitablePushNode": FeishuBitablePushNode.Comfy,
     "FeishuBitableConfigNode": FeishuBitableConfigNode.Comfy,
+    "FeishuBitableRecordNode": FeishuBitableRecordNode.Comfy,
     "FeishuBitableFieldNode": FeishuBitableFieldNode.Comfy
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "FeishuBitablePushNode": "Feishu Bitable (飞书多维表格)",
     "FeishuBitableConfigNode": "Feishu Bitable 配置",
+    "FeishuBitableRecordNode": "Feishu Bitable 行操作",
     "FeishuBitableFieldNode": "Feishu Bitable 字段"
 }
 
