@@ -76,11 +76,13 @@
 
 #### 2. Feishu Bitable 行操作 (Feishu Bitable Record)
 用于控制数据写入到哪一行。如果不连接此节点，默认会在表格末尾**新增**一行。
-*   **action**:
-    *   `更新指定行 (Update Row)`: 更新指定行号的数据。
-    *   `匹配字段更新 (Match Field)`: 查找符合条件的行进行更新（如“标题”等于“测试任务”），未找到则新增。
-*   **record_index**: 指定行号（仅在 Update Row 模式有效，从1开始）。
-*   **match_field / match_value**: 匹配条件（仅在 Match Field 模式有效）。
+*   **Feishu Bitable 更新行 (Update Row)**:
+    *   **record_index**: 指定要更新的行号（从1开始）。
+*   **Feishu Bitable 更新ID (Update ID)**:
+    *   **record_id**: 指定要更新的记录 ID (record_id)。
+*   **Feishu Bitable 匹配更新 (Match Field)**:
+    *   **match_field**: 匹配的字段名。
+    *   **match_value**: 匹配的值（找到则更新，未找到则新增）。
 
 #### 3. Feishu Bitable 配置 (Feishu Bitable Config)
 用于配置飞书 API 的连接信息。
@@ -92,6 +94,36 @@
 执行写入操作的节点。
 *   **config**: 连接配置节点的输出。
 *   **输出**: 返回写入日志。
+
+## 📨 Message Push (消息推送)
+
+AnySwitch 包含一组强大的消息推送节点，支持将 ComfyUI 的运行结果（文本、图片）推送到**飞书 (Feishu/Lark)**、**钉钉 (DingTalk)** 等即时通讯工具，甚至支持自动上传图片到 **Gitee** 图床。
+
+### 节点说明
+
+#### 1. 消息推送 (Message Push)
+核心推送节点，负责发送消息。
+*   **config**: 连接配置节点的输出。
+*   **title**: 消息标题。
+*   **content**: 消息正文内容。
+*   **any_source**: (可选) 任何要附带的数据，如 Image, String, Number 等。如果是图片，会自动上传并显示在消息中。
+
+#### 2. 飞书配置 (Feishu Config)
+配置飞书机器人的 Webhook。
+*   **feishu_webhook**: 飞书群机器人的 Webhook 地址。
+*   **feishu_secret**: (可选) 签名校验密钥。
+
+#### 3. 钉钉配置 (DingTalk Config)
+配置钉钉机器人的 Webhook。
+*   **dingtalk_token**: 钉钉机器人的 Access Token (Webhook 地址中 `access_token=` 后面的部分)。
+*   **dingtalk_secret**: (可选) 加签密钥。
+
+#### 4. Gitee图床配置 (Gitee Config)
+配置 Gitee 作为图片存储后端（因为部分 IM 工具不支持直接发送本地图片流，需要 URL）。
+*   **gitee_token**: Gitee 的私人令牌 (Personal Access Token)。
+*   **gitee_owner**: 仓库所属的用户名或组织名。
+*   **gitee_repo**: 仓库名称。
+*   **gitee_path**: 图片存放路径（默认为 `images`）。
 
 ---
 <br>
@@ -172,13 +204,11 @@ Defines a column of data to be written.
 *   **field_type**: The field type (Text, Number, Attachment, Checkbox, etc.).
 *   **pre_config**: Connects to the previous Field node for chaining configuration.
 
-#### 2. Feishu Bitable Record
-Controls which row the data is written to. If not connected, a **new row** will be appended by default.
-*   **action**:
-    *   `Update Row`: Updates data at a specific row index.
-    *   `Match Field`: Finds a row where a specific field matches a value (e.g., "Title" equals "Test Task") and updates it. If not found, appends a new row.
-*   **record_index**: The row index (1-based, only for Update Row mode).
-*   **match_field / match_value**: The matching condition (only for Match Field mode).
+#### 2. Feishu Bitable Record (Update Logic)
+Controls where the data is written. If none of these nodes are connected, a **new row** will be appended by default.
+*   **Feishu Bitable Update Row**: Updates data at a specific row index (1-based).
+*   **Feishu Bitable Update ID**: Updates data for a specific Record ID.
+*   **Feishu Bitable Match Field**: Finds a row where a specific field matches a value and updates it. If not found, appends a new row.
 
 #### 3. Feishu Bitable Config
 Configures the Feishu API connection.

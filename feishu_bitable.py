@@ -633,53 +633,96 @@ class FeishuBitableConfigNode:
                 config["feishu_app_secret"] = feishu_app_secret.strip()
             return io.NodeOutput(config)
 
-class FeishuBitableRecordNode:
+class FeishuBitableUpdateRowNode:
     CATEGORY = "maoyu/message"
-    TITLE = "表格行操作 (Bitable Record)"
+    TITLE = "更新指定行 (Update Row)"
     class Comfy(io.ComfyNode):
         @classmethod
         def define_schema(cls):
             return io.Schema(
-                node_id="FeishuBitableRecordNode",
-                display_name="Feishu Bitable 行操作",
+                node_id="FeishuBitableUpdateRowNode",
+                display_name="Feishu Bitable 更新行",
                 category="maoyu/message",
                 inputs=[
                     io.Custom("MESSAGE_CONFIG").Input("pre_config", optional=True),
-                    io.Combo.Input("action", options=[
-                        "更新指定行 (Update Row)",
-                        "匹配字段更新 (Match Field)"
-                    ], default="更新指定行 (Update Row)", tooltip="操作模式"),
-                    io.Int.Input("record_index", default=0, tooltip="行号 (1开始)，仅在更新指定行模式下有效"),
-                    io.String.Input("match_field", default="标题", tooltip="匹配字段名，仅在匹配字段更新模式下有效"),
-                    io.String.Input("match_value", default="", tooltip="匹配字段值，仅在匹配字段更新模式下有效"),
+                    io.Int.Input("record_index", default=0, tooltip="行号 (1开始，0无效)"),
                 ],
                 outputs=[io.Custom("MESSAGE_CONFIG").Output(display_name="配置信息")],
             )
         @classmethod
-        def execute(cls, action: str, record_index: int, match_field: str, match_value: str, pre_config=None) -> io.NodeOutput:
+        def execute(cls, record_index: int, pre_config=None) -> io.NodeOutput:
             config = pre_config.copy() if pre_config else {}
             if "bitable_items" not in config:
                 config["bitable_items"] = []
             
-            # 如果没有配置项，创建一个空的（虽然通常应该接在 Config 节点后面）
             if not config["bitable_items"]:
                 config["bitable_items"].append({})
             
-            # 修改最后一个配置项
             item = config["bitable_items"][-1]
+            item["record_action"] = "update_index"
+            item["record_index"] = record_index
+            return io.NodeOutput(config)
+
+class FeishuBitableUpdateIDNode:
+    CATEGORY = "maoyu/message"
+    TITLE = "更新记录ID (Update ID)"
+    class Comfy(io.ComfyNode):
+        @classmethod
+        def define_schema(cls):
+            return io.Schema(
+                node_id="FeishuBitableUpdateIDNode",
+                display_name="Feishu Bitable 更新ID",
+                category="maoyu/message",
+                inputs=[
+                    io.Custom("MESSAGE_CONFIG").Input("pre_config", optional=True),
+                    io.String.Input("record_id", default="", tooltip="记录 ID (record_id)"),
+                ],
+                outputs=[io.Custom("MESSAGE_CONFIG").Output(display_name="配置信息")],
+            )
+        @classmethod
+        def execute(cls, record_id: str, pre_config=None) -> io.NodeOutput:
+            config = pre_config.copy() if pre_config else {}
+            if "bitable_items" not in config:
+                config["bitable_items"] = []
             
-            if "Update Row" in action:
-                item["record_action"] = "update_index"
-                item["record_index"] = record_index
-            elif "Match Field" in action:
-                item["record_action"] = "update_match"
-                item["match_field"] = match_field
-                item["match_value"] = match_value
-            else:
-                # 兼容旧逻辑或异常情况，默认为 append
-                # 但既然界面上移除了 append，理论上走不到这里，除非有旧工作流
-                item["record_action"] = "append"
+            if not config["bitable_items"]:
+                config["bitable_items"].append({})
             
+            item = config["bitable_items"][-1]
+            item["record_action"] = "update_id"
+            item["record_id"] = (record_id or "").strip()
+            return io.NodeOutput(config)
+
+class FeishuBitableMatchNode:
+    CATEGORY = "maoyu/message"
+    TITLE = "匹配字段更新 (Match Field)"
+    class Comfy(io.ComfyNode):
+        @classmethod
+        def define_schema(cls):
+            return io.Schema(
+                node_id="FeishuBitableMatchNode",
+                display_name="Feishu Bitable 匹配更新",
+                category="maoyu/message",
+                inputs=[
+                    io.Custom("MESSAGE_CONFIG").Input("pre_config", optional=True),
+                    io.String.Input("match_field", default="标题", tooltip="匹配字段名"),
+                    io.String.Input("match_value", default="", tooltip="匹配字段值"),
+                ],
+                outputs=[io.Custom("MESSAGE_CONFIG").Output(display_name="配置信息")],
+            )
+        @classmethod
+        def execute(cls, match_field: str, match_value: str, pre_config=None) -> io.NodeOutput:
+            config = pre_config.copy() if pre_config else {}
+            if "bitable_items" not in config:
+                config["bitable_items"] = []
+            
+            if not config["bitable_items"]:
+                config["bitable_items"].append({})
+            
+            item = config["bitable_items"][-1]
+            item["record_action"] = "update_match"
+            item["match_field"] = match_field
+            item["match_value"] = match_value
             return io.NodeOutput(config)
 
 class FeishuBitableFieldNode:
@@ -1511,7 +1554,7 @@ class FeishuBitablePushNode:
         items = config.get("bitable_items", [])
         print(f"[FeishuBitable] bitable_items count={len(items)}")
 
-        def push_one(app_token, table_id, v_id, record_idx=0, record_action="append", match_field=None, match_value=None):
+        def push_one(app_token, table_id, v_id, record_idx=0, record_action="append", match_field=None, match_value=None, record_id_val=None):
             client = FeishuBitableClient(config.get("feishu_app_id"), config.get("feishu_app_secret"))
             resolved_app_token = client.resolve_app_token(app_token, table_id)
             if resolved_app_token != app_token:
@@ -1717,6 +1760,10 @@ class FeishuBitablePushNode:
                     logs.append(f"Record[{record_idx}] not found, skip update")
                     print(f"[FeishuBitable] Record index {record_idx} not found")
                     return
+            elif record_action == "update_id" and record_id_val:
+                print(f"[FeishuBitable] Attempting update by ID: {record_id_val}")
+                target_record_id = record_id_val
+                should_update = True
             elif record_action == "update_match" and match_field:
                 print(f"[FeishuBitable] Attempting match update: {match_field} = {match_value}")
                 # 使用 filter 查找
@@ -1808,7 +1855,7 @@ class FeishuBitablePushNode:
                      logs.append(f"Skip item: missing token/table")
                      continue
 
-                push_one(app_token_val, table_id_val, it.get("view_id", ""), ridx, raction, it.get("match_field"), it.get("match_value"))
+                push_one(app_token_val, table_id_val, it.get("view_id", ""), ridx, raction, it.get("match_field"), it.get("match_value"), it.get("record_id"))
         else:
             # 兼容老参数：当未使用配置节点时，允许直接填写
             app_token = config.get("bitable_app_token", "") or ""
@@ -1817,21 +1864,25 @@ class FeishuBitablePushNode:
                 logs.append("No Bitable target in config")
                 print("[FeishuBitable] No Bitable target in config")
             else:
-                push_one(app_token, table_id, "", 0, "append", None, None)
+                push_one(app_token, table_id, "", 0, "append", None, None, None)
 
         return (" | ".join(logs),)
 
 NODE_CLASS_MAPPINGS = {
     "FeishuBitablePushNode": FeishuBitablePushNode.Comfy,
     "FeishuBitableConfigNode": FeishuBitableConfigNode.Comfy,
-    "FeishuBitableRecordNode": FeishuBitableRecordNode.Comfy,
+    "FeishuBitableUpdateRowNode": FeishuBitableUpdateRowNode.Comfy,
+    "FeishuBitableUpdateIDNode": FeishuBitableUpdateIDNode.Comfy,
+    "FeishuBitableMatchNode": FeishuBitableMatchNode.Comfy,
     "FeishuBitableFieldNode": FeishuBitableFieldNode.Comfy
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "FeishuBitablePushNode": "Feishu Bitable (飞书多维表格)",
     "FeishuBitableConfigNode": "Feishu Bitable 配置",
-    "FeishuBitableRecordNode": "Feishu Bitable 行操作",
+    "FeishuBitableUpdateRowNode": "Feishu Bitable 更新行",
+    "FeishuBitableUpdateIDNode": "Feishu Bitable 更新ID",
+    "FeishuBitableMatchNode": "Feishu Bitable 匹配更新",
     "FeishuBitableFieldNode": "Feishu Bitable 字段"
 }
 
