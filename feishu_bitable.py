@@ -655,12 +655,19 @@ class FeishuBitableUpdateRowNode:
             if "bitable_items" not in config:
                 config["bitable_items"] = []
             
-            if not config["bitable_items"]:
-                config["bitable_items"].append({})
+            # 查找或创建一个未完成的配置项
+            target_item = None
+            if config["bitable_items"]:
+                # 如果最后一个项没有 app_token（即尚未与 ConfigNode 绑定），则复用它
+                if not config["bitable_items"][-1].get("app_token"):
+                    target_item = config["bitable_items"][-1]
             
-            item = config["bitable_items"][-1]
-            item["record_action"] = "update_index"
-            item["record_index"] = record_index
+            if target_item is None:
+                target_item = {}
+                config["bitable_items"].append(target_item)
+            
+            target_item["record_action"] = "update_index"
+            target_item["record_index"] = record_index
             return io.NodeOutput(config)
 
 class FeishuBitableUpdateIDNode:
@@ -685,12 +692,18 @@ class FeishuBitableUpdateIDNode:
             if "bitable_items" not in config:
                 config["bitable_items"] = []
             
-            if not config["bitable_items"]:
-                config["bitable_items"].append({})
+            # 查找或创建一个未完成的配置项
+            target_item = None
+            if config["bitable_items"]:
+                if not config["bitable_items"][-1].get("app_token"):
+                    target_item = config["bitable_items"][-1]
             
-            item = config["bitable_items"][-1]
-            item["record_action"] = "update_id"
-            item["record_id"] = (record_id or "").strip()
+            if target_item is None:
+                target_item = {}
+                config["bitable_items"].append(target_item)
+            
+            target_item["record_action"] = "update_id"
+            target_item["record_id"] = (record_id or "").strip()
             return io.NodeOutput(config)
 
 class FeishuBitableMatchNode:
@@ -716,13 +729,19 @@ class FeishuBitableMatchNode:
             if "bitable_items" not in config:
                 config["bitable_items"] = []
             
-            if not config["bitable_items"]:
-                config["bitable_items"].append({})
+            # 查找或创建一个未完成的配置项
+            target_item = None
+            if config["bitable_items"]:
+                if not config["bitable_items"][-1].get("app_token"):
+                    target_item = config["bitable_items"][-1]
             
-            item = config["bitable_items"][-1]
-            item["record_action"] = "update_match"
-            item["match_field"] = match_field
-            item["match_value"] = match_value
+            if target_item is None:
+                target_item = {}
+                config["bitable_items"].append(target_item)
+            
+            target_item["record_action"] = "update_match"
+            target_item["match_field"] = match_field
+            target_item["match_value"] = match_value
             return io.NodeOutput(config)
 
 class FeishuBitableFieldNode:
