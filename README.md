@@ -56,6 +56,43 @@
 
 你再也无需手动更改连线了！
 
+## 📊 Feishu Bitable Integration (飞书多维表格集成)
+
+除了流程控制，AnySwitch 现已支持将 ComfyUI 的生成结果（图片、视频、文本）自动写入到**飞书多维表格 (Feishu Bitable)**，实现自动化的数据归档和管理。
+
+### 核心功能
+*   **多类型支持**：支持写入文本、数字、图片、视频（自动作为附件上传）。
+*   **智能更新**：支持新增记录、更新指定行、或根据字段内容匹配更新。
+*   **附件管理**：自动上传图片/视频并回填到表格附件列。
+
+### 节点说明
+
+#### 1. Feishu Bitable 字段 (Feishu Bitable Field)
+用于定义要写入表格的一列数据。
+*   **field_name**: 飞书表格中的列名。
+*   **field_value**: 要写入的值（支持连接 Image, String, Int 等）。
+*   **field_type**: 字段类型（文本、数字、附件、复选框等）。
+*   **pre_config**: 连接上一个字段节点，实现链式配置。
+
+#### 2. Feishu Bitable 行操作 (Feishu Bitable Record)
+用于控制数据写入到哪一行。如果不连接此节点，默认会在表格末尾**新增**一行。
+*   **action**:
+    *   `更新指定行 (Update Row)`: 更新指定行号的数据。
+    *   `匹配字段更新 (Match Field)`: 查找符合条件的行进行更新（如“标题”等于“测试任务”），未找到则新增。
+*   **record_index**: 指定行号（仅在 Update Row 模式有效，从1开始）。
+*   **match_field / match_value**: 匹配条件（仅在 Match Field 模式有效）。
+
+#### 3. Feishu Bitable 配置 (Feishu Bitable Config)
+用于配置飞书 API 的连接信息。
+*   **app_token**: 多维表格的 App Token (URL 中 `base` 开头的部分)。
+*   **table_id**: 数据表 ID (URL 中 `tbl` 开头的部分)。
+*   **feishu_app_id / feishu_app_secret**: 飞书自建应用的凭证（需在飞书开放平台申请并开通多维表格权限）。
+
+#### 4. Feishu Bitable (飞书多维表格)
+执行写入操作的节点。
+*   **config**: 连接配置节点的输出。
+*   **输出**: 返回写入日志。
+
 ---
 <br>
 
@@ -116,3 +153,40 @@ This is a classic use case.
 *   When you don't load an image, `AnySwitch` automatically switches and passes the data from the `Empty Latent Image` node instead (triggering your Txt2Img workflow).
 
 No more manual rewiring is needed!
+
+## 📊 Feishu Bitable Integration
+
+In addition to flow control, AnySwitch now supports automatically writing ComfyUI generation results (images, videos, text) to **Feishu Bitable**, enabling automated data archiving and management.
+
+### Key Features
+*   **Multi-Type Support**: Supports writing text, numbers, images, and videos (uploaded as attachments automatically).
+*   **Smart Updates**: Supports appending new records, updating specific rows by index, or updating by matching field content.
+*   **Attachment Management**: Automatically uploads images/videos to Feishu Drive and links them to attachment columns.
+
+### Node Descriptions
+
+#### 1. Feishu Bitable Field
+Defines a column of data to be written.
+*   **field_name**: The column name in your Bitable.
+*   **field_value**: The value to write (supports Image, String, Int, etc.).
+*   **field_type**: The field type (Text, Number, Attachment, Checkbox, etc.).
+*   **pre_config**: Connects to the previous Field node for chaining configuration.
+
+#### 2. Feishu Bitable Record
+Controls which row the data is written to. If not connected, a **new row** will be appended by default.
+*   **action**:
+    *   `Update Row`: Updates data at a specific row index.
+    *   `Match Field`: Finds a row where a specific field matches a value (e.g., "Title" equals "Test Task") and updates it. If not found, appends a new row.
+*   **record_index**: The row index (1-based, only for Update Row mode).
+*   **match_field / match_value**: The matching condition (only for Match Field mode).
+
+#### 3. Feishu Bitable Config
+Configures the Feishu API connection.
+*   **app_token**: The App Token of your Bitable (starts with `base` in the URL).
+*   **table_id**: The Table ID (starts with `tbl` in the URL).
+*   **feishu_app_id / feishu_app_secret**: Credentials for your custom Feishu App (requires Bitable permissions).
+
+#### 4. Feishu Bitable (Push Node)
+The execution node that performs the write operation.
+*   **config**: Connects to the Config node output.
+*   **Output**: Returns the operation log.
