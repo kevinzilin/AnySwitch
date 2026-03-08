@@ -3,12 +3,15 @@ from .nodes import AnySwitch, AnyBooleanSwitch, AnyIsEmpty
 # 尝试导入子模块中的节点
 # 使用 try-except 防止因为缺少依赖（如 numpy, PIL 等）导致整个插件加载失败
 
+import traceback
+
 # 1. dir_path 模块
 try:
     from .dir_path import NODE_CLASS_MAPPINGS as _dir_nodes
     from .dir_path import NODE_DISPLAY_NAME_MAPPINGS as _dir_display_names
 except Exception as e:
     print(f"\033[33m[AnySwitch] Warning: Failed to load nodes from dir_path.py. Error: {e}\033[0m")
+    traceback.print_exc()
     _dir_nodes = {}
     _dir_display_names = {}
 
@@ -18,6 +21,7 @@ try:
     from .smart_gate import NODE_DISPLAY_NAME_MAPPINGS as _gate_display_names
 except Exception as e:
     print(f"\033[33m[AnySwitch] Warning: Failed to load nodes from smart_gate.py. Error: {e}\033[0m")
+    traceback.print_exc()
     _gate_nodes = {}
     _gate_display_names = {}
 
@@ -28,6 +32,7 @@ try:
     from .message_pusher import NODE_DISPLAY_NAME_MAPPINGS as _message_display_names
 except Exception as e:
     print(f"\033[33m[AnySwitch] Warning: Failed to load nodes from message_pusher.py. Error: {e}\033[0m")
+    traceback.print_exc()
     _message_nodes = {}
     _message_display_names = {}
 
@@ -37,6 +42,7 @@ try:
     from .feishu_bitable import NODE_DISPLAY_NAME_MAPPINGS as _bitable_display_names
 except Exception as e:
     print(f"\033[33m[AnySwitch] Warning: Failed to load nodes from feishu_bitable.py. Error: {e}\033[0m")
+    traceback.print_exc()
     _bitable_nodes = {}
     _bitable_display_names = {}
 

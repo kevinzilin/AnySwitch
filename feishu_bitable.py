@@ -5,10 +5,34 @@ import io as pyio
 import uuid
 import re
 import requests
-import numpy as np
-from PIL import Image
 from comfy_api.latest import io
 import folder_paths
+
+# Delay import numpy/PIL/torchaudio/torch to avoid circular import issues or load failures
+np = None
+Image = None
+torchaudio = None
+torch = None
+
+def _lazy_import_numpy_pil():
+    global np, Image
+    if np is None:
+        import numpy as n
+        np = n
+    if Image is None:
+        from PIL import Image as I
+        Image = I
+
+def _lazy_import_torch():
+    global torchaudio, torch
+    try:
+        import torchaudio as ta
+        import torch as t
+        torchaudio = ta
+        torch = t
+        return True
+    except ImportError:
+        return False
 
 MAX_SAFE_INT = 9007199254740991
 
@@ -603,22 +627,29 @@ class FeishuBitableConfigNode:
         @classmethod
         def execute(cls, app_token: str, table_id: str, view_id: str, feishu_app_id: str, feishu_app_secret: str, pre_config=None) -> io.NodeOutput:
             config = pre_config.copy() if pre_config else {}
+            # Deep copy bitable_items list to avoid side effects on upstream cache
             if "bitable_items" not in config:
                 config["bitable_items"] = []
+            else:
+                config["bitable_items"] = list(config["bitable_items"])
             
             # 如果上游已经有 Record 节点生成的“空配置项”（只有 action 等），则合并进去
             # 否则创建一个新的配置项
-            target_item = None
+            target_index = -1
             if config["bitable_items"]:
                 # 寻找最后一个还没有 app_token 的项
-                for item in reversed(config["bitable_items"]):
-                    if not item.get("app_token"):
-                        target_item = item
+                for idx in range(len(config["bitable_items"]) - 1, -1, -1):
+                    if not config["bitable_items"][idx].get("app_token"):
+                        target_index = idx
                         break
             
-            if target_item is None:
+            if target_index == -1:
                 target_item = {}
                 config["bitable_items"].append(target_item)
+            else:
+                # Copy the item before modifying
+                target_item = config["bitable_items"][target_index].copy()
+                config["bitable_items"][target_index] = target_item
             
             if app_token.strip():
                 target_item["app_token"] = app_token.strip()
@@ -654,17 +685,22 @@ class FeishuBitableUpdateRowNode:
             config = pre_config.copy() if pre_config else {}
             if "bitable_items" not in config:
                 config["bitable_items"] = []
+            else:
+                config["bitable_items"] = list(config["bitable_items"])
             
             # 查找或创建一个未完成的配置项
-            target_item = None
+            target_index = -1
             if config["bitable_items"]:
                 # 如果最后一个项没有 app_token（即尚未与 ConfigNode 绑定），则复用它
                 if not config["bitable_items"][-1].get("app_token"):
-                    target_item = config["bitable_items"][-1]
+                    target_index = len(config["bitable_items"]) - 1
             
-            if target_item is None:
+            if target_index == -1:
                 target_item = {}
                 config["bitable_items"].append(target_item)
+            else:
+                target_item = config["bitable_items"][target_index].copy()
+                config["bitable_items"][target_index] = target_item
             
             target_item["record_action"] = "update_index"
             target_item["record_index"] = record_index
@@ -691,16 +727,21 @@ class FeishuBitableUpdateIDNode:
             config = pre_config.copy() if pre_config else {}
             if "bitable_items" not in config:
                 config["bitable_items"] = []
+            else:
+                config["bitable_items"] = list(config["bitable_items"])
             
             # 查找或创建一个未完成的配置项
-            target_item = None
+            target_index = -1
             if config["bitable_items"]:
                 if not config["bitable_items"][-1].get("app_token"):
-                    target_item = config["bitable_items"][-1]
+                    target_index = len(config["bitable_items"]) - 1
             
-            if target_item is None:
+            if target_index == -1:
                 target_item = {}
                 config["bitable_items"].append(target_item)
+            else:
+                target_item = config["bitable_items"][target_index].copy()
+                config["bitable_items"][target_index] = target_item
             
             target_item["record_action"] = "update_id"
             target_item["record_id"] = (record_id or "").strip()
@@ -728,16 +769,21 @@ class FeishuBitableMatchNode:
             config = pre_config.copy() if pre_config else {}
             if "bitable_items" not in config:
                 config["bitable_items"] = []
+            else:
+                config["bitable_items"] = list(config["bitable_items"])
             
             # 查找或创建一个未完成的配置项
-            target_item = None
+            target_index = -1
             if config["bitable_items"]:
                 if not config["bitable_items"][-1].get("app_token"):
-                    target_item = config["bitable_items"][-1]
+                    target_index = len(config["bitable_items"]) - 1
             
-            if target_item is None:
+            if target_index == -1:
                 target_item = {}
                 config["bitable_items"].append(target_item)
+            else:
+                target_item = config["bitable_items"][target_index].copy()
+                config["bitable_items"][target_index] = target_item
             
             target_item["record_action"] = "update_match"
             target_item["match_field"] = match_field
@@ -767,15 +813,46 @@ class FeishuBitableFieldNode:
         @classmethod
         def execute(cls, field_name: str, field_value, field_type: str, pre_config=None) -> io.NodeOutput:
             config = pre_config.copy() if pre_config else {}
-            if "bitable_fields" not in config:
-                config["bitable_fields"] = []
+            if "bitable_items" not in config:
+                config["bitable_items"] = []
+            else:
+                config["bitable_items"] = list(config["bitable_items"])
+            
+            # 查找或创建一个未完成的配置项
+            target_index = -1
+            if config["bitable_items"]:
+                # 如果最后一个项没有 app_token（即尚未与 ConfigNode 绑定），则复用它
+                if not config["bitable_items"][-1].get("app_token"):
+                    target_index = len(config["bitable_items"]) - 1
+            
+            if target_index == -1:
+                target_item = {}
+                config["bitable_items"].append(target_item)
+            else:
+                target_item = config["bitable_items"][target_index].copy()
+                config["bitable_items"][target_index] = target_item
+            
+            if "fields" not in target_item:
+                target_item["fields"] = {}
+            else:
+                target_item["fields"] = target_item["fields"].copy()
+                
+            if "field_types" not in target_item:
+                target_item["field_types"] = {}
+            else:
+                target_item["field_types"] = target_item["field_types"].copy()
+                
             name = (field_name or "").strip()
             if name:
-                config["bitable_fields"].append({
-                    "name": name,
-                    "value": field_value,
-                    "type": field_type
-                })
+                target_item["fields"][name] = field_value
+                # Mapping user-friendly type name to internal type code/string if needed
+                ftype = field_type
+                for k, v in TYPE_ALIASES.items():
+                    if k in field_type: # e.g. "文本" in "文本 (Text)"
+                        ftype = v
+                        break
+                target_item["field_types"][name] = ftype
+                
             return io.NodeOutput(config)
 
 class FeishuBitablePushNode:
@@ -826,6 +903,8 @@ class FeishuBitablePushNode:
             return True
 
     def _tensor_to_bytes(self, tensor):
+        _lazy_import_torch()
+        _lazy_import_numpy_pil()
         if hasattr(tensor, "shape"):
             dims = len(tensor.shape)
             if dims == 4:
@@ -842,6 +921,108 @@ class FeishuBitablePushNode:
         buffered = pyio.BytesIO()
         image.save(buffered, format="PNG")
         return buffered.getvalue()
+
+    def _audio_to_bytes(self, audio_data):
+        _lazy_import_torch()
+        _lazy_import_numpy_pil()
+        if not (torchaudio and torch):
+            print("[FeishuBitable] torchaudio/torch not available for audio processing")
+            return None
+        try:
+            waveform = None
+            sample_rate = None
+            
+            if isinstance(audio_data, dict):
+                waveform = audio_data.get("waveform")
+                sample_rate = audio_data.get("sample_rate")
+            elif hasattr(audio_data, "waveform") and hasattr(audio_data, "sample_rate"):
+                waveform = audio_data.waveform
+                sample_rate = audio_data.sample_rate
+            elif "LazyAudioMap" in type(audio_data).__name__:
+                try:
+                    # LazyAudioMap usually behaves like a dict or has methods to get data
+                    if hasattr(audio_data, "get"):
+                        waveform = audio_data.get("waveform")
+                        sample_rate = audio_data.get("sample_rate")
+                    # If it's a mapping but not a dict
+                    elif hasattr(audio_data, "__getitem__"):
+                        waveform = audio_data["waveform"]
+                        sample_rate = audio_data["sample_rate"]
+                        
+                    # Handle the case where values might be functions or properties needing access
+                    if callable(waveform): waveform = waveform()
+                    if callable(sample_rate): sample_rate = sample_rate()
+                    
+                    # Special handling for LazyAudioMap from VHS
+                    # It might store internal state differently, let's try to access it directly if possible
+                    # or force evaluation if it has such methods
+                    
+                except Exception as e:
+                    print(f"[FeishuBitable] LazyAudioMap access error: {e}")
+            
+            if waveform is not None and sample_rate:
+                # waveform shape: [batch, channels, time] or [channels, time]
+                if hasattr(waveform, "shape") and len(waveform.shape) == 3:
+                    # Take first in batch
+                    waveform = waveform[0]
+                
+                buff = pyio.BytesIO()
+
+                # Force format="WAV" to use soundfile backend, avoid torchcodec
+                # torchaudio 2.0+ might try to use ffmpeg or other backends if not specified
+                # or if the data type is weird. float32 + WAV is the safest bet for soundfile.
+                # Force use of soundfile backend if available
+                # In newer torchaudio, get_audio_backend is removed, but we can try setting it via global config
+                # or just ensure we pass correct args.
+                # However, torchaudio.save might default to ffmpeg or others if available.
+                # Explicitly trying to use soundfile if installed.
+                
+                try:
+                    import soundfile
+                    # If soundfile is available, we can use it directly or via torchaudio
+                    # But torchaudio.save is convenient.
+                    # Let's try to set the backend if the function exists
+                    if hasattr(torchaudio, "set_audio_backend"):
+                        if torchaudio.get_audio_backend() != 'soundfile':
+                            torchaudio.set_audio_backend('soundfile')
+                except Exception:
+                    pass
+
+                # Final fallback: ensure tensor is on CPU and is float32
+                if hasattr(waveform, "cpu"):
+                    waveform = waveform.cpu()
+                
+                if hasattr(waveform, "dtype") and hasattr(torch, "float32"):
+                     if waveform.dtype != torch.float32:
+                         waveform = waveform.float()
+
+                # Try saving with specific backend arg if supported in newer versions, 
+                # but 'backend' arg was deprecated/removed in some versions too.
+                # The safest way across versions without torchcodec is ensuring float32 + WAV.
+                
+                try:
+                    # Try default save
+                    torchaudio.save(buff, waveform, sample_rate, format="WAV")
+                except Exception as e_save:
+                    # If default save fails (e.g. asking for torchcodec), try using soundfile directly if possible
+                    # or try a different strategy.
+                    print(f"[FeishuBitable] torchaudio.save failed: {e_save}. Trying soundfile direct write...")
+                    try:
+                        import soundfile as sf
+                        # soundfile expects (frames, channels) numpy array
+                        # waveform is (channels, frames) tensor
+                        audio_np = waveform.numpy().T
+                        sf.write(buff, audio_np, sample_rate, format="WAV")
+                    except Exception as e_sf:
+                        print(f"[FeishuBitable] soundfile direct write failed: {e_sf}")
+                        raise e_save
+
+                return buff.getvalue()
+        except Exception as e:
+            print(f"[FeishuBitable] Audio conversion error: {e}")
+            import traceback
+            traceback.print_exc()
+        return None
 
     def _upload_file_gitee(self, file_bytes, filename, config):
         token = config.get("gitee_token")
@@ -874,7 +1055,7 @@ class FeishuBitablePushNode:
         return self._upload_file_gitee(image_bytes, filename, cfg)
     
     def _image_bytes_to_data_url(self, image_bytes):
-
+        _lazy_import_numpy_pil()
         try:
             b64 = base64.b64encode(image_bytes).decode("utf-8")
             return f"data:image/png;base64,{b64}"
@@ -888,7 +1069,55 @@ class FeishuBitablePushNode:
                 self.filename = filename
 
         logs = []
-        fields = {}
+        
+        # 1. 预处理：兼容旧版 bitable_fields 配置
+        items = config.get("bitable_items", [])
+        legacy_fields = config.get("bitable_fields", [])
+        # 如果没有 items 但有 legacy fields，尝试转换
+        if legacy_fields and not items:
+             app_token = config.get("bitable_app_token", "")
+             table_id = config.get("bitable_table_id", "")
+             if app_token and table_id:
+                 new_item = {"app_token": app_token, "table_id": table_id, "fields": {}, "field_types": {}}
+                 for f in legacy_fields:
+                     if f.get("name"):
+                         new_item["fields"][f["name"]] = f.get("value")
+                         new_item["field_types"][f["name"]] = f.get("type", "text")
+                 items.append(new_item)
+                 logs.append("Converted legacy fields to item")
+
+        print(f"[FeishuBitable] Push started. Items count: {len(items)}")
+        
+        def dump_obj(obj, level=0):
+            indent = "  " * level
+            if isinstance(obj, dict):
+                res = "{\n"
+                for k, v in obj.items():
+                    res += f"{indent}  {repr(k)}: {dump_obj(v, level+1)},\n"
+                res += f"{indent}}}"
+                return res
+            elif isinstance(obj, list):
+                res = "[\n"
+                for v in obj:
+                    res += f"{indent}  {dump_obj(v, level+1)},\n"
+                res += f"{indent}]"
+                return res
+            elif isinstance(obj, (bytes, bytearray)):
+                return f"<bytes len={len(obj)}>"
+            elif hasattr(obj, "shape") and hasattr(obj, "dtype"): # Tensor/Numpy
+                return f"<Tensor shape={obj.shape} dtype={obj.dtype}>"
+            else:
+                s = repr(obj)
+                if len(s) > 200:
+                    s = s[:200] + "..."
+                return s
+
+        for idx, item in enumerate(items):
+            fields_data = item.get("fields", {})
+            print(f"[FeishuBitable] Item {idx} fields keys: {list(fields_data.keys())}")
+            for k, v in fields_data.items():
+                print(f"[FeishuBitable] Field '{k}' DUMP:\n{dump_obj(v)}")
+
         try:
             has_app_id = bool((config.get("feishu_app_id") or "").strip())
             has_app_secret = bool((config.get("feishu_app_secret") or "").strip())
@@ -924,6 +1153,42 @@ class FeishuBitablePushNode:
                 pass
             return False
 
+        def _resolve_comfy_path(v_path, v_sub="", v_type="input"):
+            if not v_path:
+                return None
+            if os.path.isabs(v_path) and os.path.exists(v_path):
+                return v_path
+            
+            if hasattr(folder_paths, 'get_annotated_filepath'):
+                try:
+                    p = folder_paths.get_annotated_filepath(v_path, v_sub)
+                    if p and os.path.exists(p):
+                        return p
+                except Exception:
+                    pass
+            
+            roots = []
+            if v_type == "input":
+                roots.append(folder_paths.get_input_directory())
+            elif v_type == "output":
+                roots.append(folder_paths.get_output_directory())
+            elif v_type == "temp":
+                roots.append(folder_paths.get_temp_directory())
+            else:
+                roots.append(folder_paths.get_output_directory())
+                roots.append(folder_paths.get_input_directory())
+                roots.append(folder_paths.get_temp_directory())
+            
+            for root in roots:
+                if not root: continue
+                p = os.path.join(root, v_sub, v_path) if v_sub else os.path.join(root, v_path)
+                if os.path.exists(p) and os.path.isfile(p):
+                    return p
+            
+            if os.path.exists(v_path) and os.path.isfile(v_path):
+                return os.path.abspath(v_path)
+            return None
+
         def _value_to_image_bytes(v):
             try:
                 if is_image_like(v):
@@ -955,7 +1220,6 @@ class FeishuBitablePushNode:
             except Exception:
                 ft = "text"
             if ft == "number":
-                # 尝试把值转换成数值；字符串提取首个数字；列表取首个可转换项
                 def to_num(x):
                     if isinstance(x, bool):
                         return int(x)
@@ -966,7 +1230,6 @@ class FeishuBitablePushNode:
                         if not s:
                             return None
                         s = s.replace(",", "")
-                        # 尝试直接转换；失败则用正则提取第一个数字片段
                         try:
                             if "." in s:
                                 return float(s)
@@ -989,7 +1252,6 @@ class FeishuBitablePushNode:
                     return None
                 return to_num(v)
             elif ft == "checkbox":
-                # 复选框转换为布尔
                 if isinstance(v, bool):
                     return v
                 if isinstance(v, (int, float)):
@@ -999,109 +1261,249 @@ class FeishuBitablePushNode:
                     return s in ("1", "true", "yes", "y", "on", "是", "开")
                 return bool(v)
             else:
-                # 其他类型一律转为字符串
                 try:
                     return str(v)
                 except Exception:
                     return ""
 
-        extra_fields = config.get("bitable_fields", [])
-        print(f"[FeishuBitable] extra_fields count={len(extra_fields)}")
-        field_types = {}
-        def _norm_type(t):
-            try:
-                s = str(t or "").strip().lower()
-            except Exception:
-                return "text"
-            return TYPE_ALIASES.get(s, s if s else "text")
-        for f in extra_fields:
-            name = f.get("name")
-            ftype = _norm_type((f.get("type") or "text").strip().lower())
-            value = f.get("value")
-            if not name:
-                continue
+        def process_fields(raw_fields, raw_types):
+            fields = {}
+            field_types = {}
             
-            field_types[name] = ftype
-            if ftype in ("attachment", "url"):
-                has_gitee = bool(config.get("gitee_token")) and bool(config.get("gitee_owner")) and bool(config.get("gitee_repo"))
-                if isinstance(value, list):
+            def _norm_type(t):
+                try:
+                    s = str(t or "").strip().lower()
+                except Exception:
+                    return "text"
+                return TYPE_ALIASES.get(s, s if s else "text")
+
+            for name, value in raw_fields.items():
+                if not name:
+                    continue
+                ftype = _norm_type(raw_types.get(name, "text"))
+                field_types[name] = ftype
+                
+                if ftype in ("attachment", "url"):
+                    has_gitee = bool(config.get("gitee_token")) and bool(config.get("gitee_owner")) and bool(config.get("gitee_repo"))
+                    
+                    val_list = value if isinstance(value, list) else [value]
+                    
                     urls = []
                     attachments = []
-                    for v in value:
-                        if _is_url_string(v):
-                            urls.append(v.strip())
-                        elif isinstance(v, str) and os.path.exists(v) and os.path.isfile(v):
-                            # 本地文件：优先作为文件处理，保留文件名，使用 upload_file 接口
-                            try:
-                                with open(v, "rb") as f:
-                                    vb = f.read()
-                                fname = os.path.basename(v)
-                                if ftype == "attachment":
-                                    attachments.append(MediaItem(vb, fname))
-                                elif has_gitee:
-                                    u = self._upload_file_gitee(vb, fname, config)
-                                    if u:
-                                        urls.append(u)
-                                        logs.append(f"Uploaded: {u}")
-                                    else:
-                                        logs.append("Gitee Upload Failed")
-                                else:
-                                    # URL 类型且无 Gitee，如果是视频/文件，回退到附件
-                                    if _is_video_file(v):
+                    
+                    for v in val_list:
+                        if isinstance(v, str):
+                            real_path = _resolve_comfy_path(v)
+                            if real_path:
+                                try:
+                                    with open(real_path, "rb") as f:
+                                        vb = f.read()
+                                    fname = os.path.basename(real_path)
+                                    if ftype == "attachment":
                                         attachments.append(MediaItem(vb, fname))
-                                        logs.append("Video fallback to attachment")
+                                    elif has_gitee:
+                                        u = self._upload_file_gitee(vb, fname, config)
+                                        if u:
+                                            urls.append(u)
+                                            logs.append(f"Uploaded: {u}")
+                                        else:
+                                            logs.append("Gitee Upload Failed")
                                     else:
-                                        # 图片文件且无 Gitee，转为 data-url
-                                        du = self._image_bytes_to_data_url(vb)
-                                        if du:
-                                            urls.append(du)
-                                            logs.append("Fallback: data-url")
-                            except Exception as e:
-                                logs.append(f"File read error: {e}")
-                        # 兼容 ComfyUI LoadVideo/VHS 等节点的输出，可能是 dict 且包含 'filename' 或 'video_path'
-                        elif isinstance(v, dict) and ("filename" in v or "video_path" in v):
+                                        if _is_video_file(real_path):
+                                            attachments.append(MediaItem(vb, fname))
+                                            logs.append("Video fallback to attachment")
+                                        else:
+                                            du = self._image_bytes_to_data_url(vb)
+                                            if du:
+                                                urls.append(du)
+                                                logs.append("Fallback: data-url")
+                                except Exception as e:
+                                    logs.append(f"File read error: {e}")
+                            elif _is_url_string(v):
+                                urls.append(v.strip())
+                        
+                        elif isinstance(v, dict):
                             try:
-                                v_path = v.get("video_path") or v.get("filename")
+                                v_paths = []
+                                if "filename" in v or "video_path" in v:
+                                    v_paths.append(v.get("video_path") or v.get("filename"))
+                                elif "filenames" in v and isinstance(v["filenames"], list):
+                                    v_paths.extend(v["filenames"])
+                                elif "waveform" in v and "sample_rate" in v:
+                                    pass
+                                
                                 v_sub = v.get("subfolder", "")
                                 v_type = v.get("type", "input")
                                 
-                                # 处理相对路径：尝试拼接 ComfyUI 目录
-                                real_path = v_path
-                                if v_path and not os.path.isabs(v_path):
-                                    real_path = folder_paths.get_annotated_filepath(v_path, v_sub) if hasattr(folder_paths, 'get_annotated_filepath') else None
-                                    if not real_path:
-                                         # Fallback
-                                         base = folder_paths.get_input_directory() if v_type == "input" else folder_paths.get_output_directory()
-                                         if v_sub:
-                                             base = os.path.join(base, v_sub)
-                                         real_path = os.path.join(base, v_path)
-                                
-                                if real_path and os.path.exists(real_path) and os.path.isfile(real_path):
-                                     with open(real_path, "rb") as f:
-                                        vb = f.read()
-                                     fname = os.path.basename(real_path)
-                                     if ftype == "attachment":
-                                         attachments.append(MediaItem(vb, fname))
-                                     elif has_gitee:
-                                         u = self._upload_file_gitee(vb, fname, config)
-                                         if u:
-                                             urls.append(u)
-                                             logs.append(f"Uploaded: {u}")
-                                         else:
-                                             logs.append("Gitee Upload Failed")
-                                     else:
-                                         if _is_video_file(real_path):
-                                             attachments.append(MediaItem(vb, fname))
-                                             logs.append("Video fallback to attachment")
-                                         else:
-                                             du = self._image_bytes_to_data_url(vb)
-                                             if du:
-                                                 urls.append(du)
-                                                 logs.append("Fallback: data-url")
-                                else:
-                                    logs.append(f"Video file not found: {v_path}")
+                                for v_path in v_paths:
+                                    if isinstance(v_path, list):
+                                        for sub_p in v_path:
+                                            real_path = _resolve_comfy_path(sub_p, v_sub, v_type)
+                                            if real_path:
+                                                with open(real_path, "rb") as f:
+                                                    vb = f.read()
+                                                fname = os.path.basename(real_path)
+                                                if ftype == "attachment":
+                                                    attachments.append(MediaItem(vb, fname))
+                                                elif has_gitee:
+                                                    u = self._upload_file_gitee(vb, fname, config)
+                                                    if u:
+                                                        urls.append(u)
+                                                        logs.append(f"Uploaded: {u}")
+                                                else:
+                                                    if ftype == "url":
+                                                        if _is_video_file(real_path):
+                                                            attachments.append(MediaItem(vb, fname))
+                                                            logs.append("Video URL fallback to attachment")
+                                                        else:
+                                                            du = self._image_bytes_to_data_url(vb)
+                                                            if du:
+                                                                urls.append(du)
+                                    else:
+                                        real_path = _resolve_comfy_path(v_path, v_sub, v_type)
+                                        if real_path:
+                                             with open(real_path, "rb") as f:
+                                                vb = f.read()
+                                             fname = os.path.basename(real_path)
+                                             if ftype == "attachment":
+                                                 attachments.append(MediaItem(vb, fname))
+                                             elif has_gitee:
+                                                 u = self._upload_file_gitee(vb, fname, config)
+                                                 if u:
+                                                     urls.append(u)
+                                                     logs.append(f"Uploaded: {u}")
+                                             else:
+                                                 if _is_video_file(real_path):
+                                                     attachments.append(MediaItem(vb, fname))
+                                                     logs.append("Video fallback to attachment")
+                                                 else:
+                                                     du = self._image_bytes_to_data_url(vb)
+                                                     if du:
+                                                         urls.append(du)
+                                                         logs.append("Fallback: data-url")
+                                        else:
+                                            logs.append(f"Video file not found: {v_path}")
                             except Exception as e:
                                 logs.append(f"Video dict read error: {e}")
+
+                        if (isinstance(v, dict) and "waveform" in v and "sample_rate" in v) or (hasattr(v, "waveform") and hasattr(v, "sample_rate")) or "LazyAudioMap" in type(v).__name__:
+                            print(f"[FeishuBitable] Processing audio object: {type(v)}")
+                            try:
+                                ab = self._audio_to_bytes(v)
+                                if ab:
+                                    fname = f"audio_{uuid.uuid4().hex}.wav"
+                                    if ftype == "attachment":
+                                        attachments.append(MediaItem(ab, fname))
+                                    elif has_gitee:
+                                        u = self._upload_file_gitee(ab, fname, config)
+                                        if u:
+                                            urls.append(u)
+                                    else:
+                                        attachments.append(MediaItem(ab, fname))
+                                else:
+                                    print("[FeishuBitable] Audio conversion returned None")
+                            except Exception as e:
+                                print(f"[FeishuBitable] Audio processing error: {e}")
+                                import traceback
+                                traceback.print_exc()
+                                logs.append(f"Audio processing error: {e}")
+                            # Continue to next item in val_list
+                            continue
+                        
+                        elif hasattr(v, "get_stream_source") or hasattr(v, "save_to") or hasattr(v, "file_path") or hasattr(v, "path") or hasattr(v, "filename") or "VideoFromComponents" in type(v).__name__:
+                            print(f"[FeishuBitable] Processing video-like object: {v}")
+                            print(f"[FeishuBitable] Object type: {type(v)}")
+                            try:
+                                source_path = getattr(v, "file_path", None) or getattr(v, "path", None) or getattr(v, "filename", None)
+                                print(f"[FeishuBitable] Initial source_path: {source_path}")
+                                source_bytes = None
+                                
+                                if not source_path and hasattr(v, "get_stream_source"):
+                                    print("[FeishuBitable] Trying get_stream_source()")
+                                    try:
+                                        stream_src = v.get_stream_source()
+                                        if isinstance(stream_src, str):
+                                            source_path = stream_src
+                                            print(f"[FeishuBitable] get_stream_source returned path: {source_path}")
+                                        elif hasattr(stream_src, "read"):
+                                            print("[FeishuBitable] get_stream_source returned stream")
+                                            if hasattr(stream_src, "getvalue"):
+                                                source_bytes = stream_src.getvalue()
+                                            else:
+                                                stream_src.seek(0)
+                                                source_bytes = stream_src.read()
+                                            print(f"[FeishuBitable] Stream bytes read: {len(source_bytes) if source_bytes else 0}")
+                                    except Exception as e:
+                                        print(f"[FeishuBitable] get_stream_source failed: {e}")
+                                        # Proceed to save_to fallback
+                                
+                                # If no path and no stream bytes, try save_to (VideoFromComponents)
+                                if not source_path and not source_bytes and (hasattr(v, "save_to") or "VideoFromComponents" in type(v).__name__):
+                                    print(f"[FeishuBitable] Attempting v.save_to for {v}")
+                                    try:
+                                        from comfy_api.latest import Types
+                                        temp_dir = folder_paths.get_temp_directory()
+                                        if not temp_dir:
+                                            temp_dir = folder_paths.get_output_directory()
+                                        
+                                        temp_name = f"feishu_vid_{uuid.uuid4().hex}.mp4"
+                                        temp_path = os.path.join(temp_dir, temp_name)
+                                        print(f"[FeishuBitable] Temp video path: {temp_path}")
+                                        
+                                        # Use "auto" codec to be safe, or "libx264" for mp4
+                                        # SaveVideo uses: format=Types.VideoContainer(format), codec=codec
+                                        # We enforce mp4 container.
+                                        v.save_to(temp_path, format=Types.VideoContainer("mp4"), codec="auto")
+                                        
+                                        if os.path.exists(temp_path):
+                                            fsize = os.path.getsize(temp_path)
+                                            print(f"[FeishuBitable] Temp video saved. Size: {fsize}")
+                                            if fsize > 0:
+                                                with open(temp_path, "rb") as f:
+                                                    source_bytes = f.read()
+                                                fname = temp_name
+                                                try:
+                                                    os.remove(temp_path)
+                                                except:
+                                                    pass
+                                            else:
+                                                print("[FeishuBitable] Temp video is empty!")
+                                        else:
+                                            print("[FeishuBitable] Temp video file not found after save_to")
+                                    except Exception as e:
+                                        err_msg = f"Video save_to failed: {e}"
+                                        print(f"[FeishuBitable] {err_msg}")
+                                        import traceback
+                                        traceback.print_exc()
+                                        logs.append(err_msg)
+
+                                if source_path:
+                                    real_path = _resolve_comfy_path(source_path)
+                                    if real_path:
+                                        with open(real_path, "rb") as f:
+                                            source_bytes = f.read()
+                                        fname = os.path.basename(real_path)
+                                    else:
+                                        logs.append(f"Video object path not found: {source_path}")
+                                elif not source_bytes:
+                                     pass
+                                
+                                if source_bytes:
+                                    fname = getattr(v, "filename", f"video_{uuid.uuid4().hex}.mp4")
+                                    if ftype == "attachment":
+                                        attachments.append(MediaItem(source_bytes, fname))
+                                    elif has_gitee:
+                                        u = self._upload_file_gitee(source_bytes, fname, config)
+                                        if u:
+                                            urls.append(u)
+                                    else:
+                                        attachments.append(MediaItem(source_bytes, fname))
+                            except Exception as e:
+                                print(f"[FeishuBitable] Video processing loop error: {e}")
+                                import traceback
+                                traceback.print_exc()
+                                logs.append(f"Video object error: {e}")
+                        
                         else:
                             try:
                                 if is_image_like(v) and hasattr(v, "shape") and len(v.shape) == 4 and int(v.shape[0]) > 1:
@@ -1113,19 +1515,14 @@ class FeishuBitablePushNode:
                                             u = self._upload_image_gitee(ib, config)
                                             if u:
                                                 urls.append(u)
-                                                logs.append(f"Uploaded: {u}")
-                                            elif config.get("gitee_token"):
-                                                logs.append("Gitee Upload Failed")
-                                            if not u:
+                                            elif not u:
                                                 du = self._image_bytes_to_data_url(ib)
                                                 if du:
                                                     urls.append(du)
-                                                    logs.append("Fallback: data-url")
                                         else:
                                             du = self._image_bytes_to_data_url(ib)
                                             if du:
                                                 urls.append(du)
-                                                logs.append("Fallback: data-url")
                                 else:
                                     ib = _value_to_image_bytes(v)
                                     if ib:
@@ -1135,21 +1532,17 @@ class FeishuBitablePushNode:
                                             u = self._upload_image_gitee(ib, config)
                                             if u:
                                                 urls.append(u)
-                                                logs.append(f"Uploaded: {u}")
-                                            elif config.get("gitee_token"):
-                                                logs.append("Gitee Upload Failed")
-                                            if not u:
+                                            elif not u:
                                                 du = self._image_bytes_to_data_url(ib)
                                                 if du:
                                                     urls.append(du)
-                                                    logs.append("Fallback: data-url")
                                         else:
                                             du = self._image_bytes_to_data_url(ib)
                                             if du:
                                                 urls.append(du)
-                                                logs.append("Fallback: data-url")
                             except Exception:
                                 pass
+
                     if ftype == "attachment":
                         fields[name] = attachments
                     else:
@@ -1157,454 +1550,89 @@ class FeishuBitablePushNode:
                             if has_gitee and urls:
                                 fields[name] = "\n".join(urls)
                             else:
-                                # 无图床时，URL列改为写附件到“列名附件”
                                 fallback_name = f"{name}附件"
                                 field_types[fallback_name] = "attachment"
-                                # 尝试从原值重新收集附件
                                 att2 = []
-                                try:
-                                    for vv in value:
-                                        if _is_url_string(vv):
-                                            continue
-                                        if is_image_like(vv) and hasattr(vv, "shape") and len(vv.shape) == 4 and int(vv.shape[0]) > 1:
-                                            for b in range(int(vv.shape[0])):
-                                                ibb = self._tensor_to_bytes(vv[b:b+1])
-                                                att2.append(ibb)
-                                        else:
-                                            ibb = _value_to_image_bytes(vv)
-                                            if ibb:
-                                                att2.append(ibb)
-                                except Exception:
-                                    pass
+                                if attachments:
+                                    att2.extend(attachments)
+                                if not att2:
+                                    for vv in val_list:
+                                         if not _is_url_string(vv):
+                                             ib = _value_to_image_bytes(vv)
+                                             if ib: att2.append(ib)
                                 if att2:
                                     fields[fallback_name] = att2
                                     logs.append(f"URL fallback to attachment: {fallback_name}")
                         else:
                             if urls:
                                 fields[name] = "\n".join(urls)
+
                 else:
-                    if _is_url_string(value):
-                        fields[name] = value.strip()
-                    elif isinstance(value, str) and os.path.exists(value) and os.path.isfile(value):
-                        # 本地文件：优先作为文件处理
-                        try:
-                            with open(value, "rb") as f:
-                                vb = f.read()
-                            fname = os.path.basename(value)
-                            if ftype == "attachment":
-                                fields[name] = [MediaItem(vb, fname)]
-                            elif has_gitee:
-                                u = self._upload_file_gitee(vb, fname, config)
-                                if u:
-                                    fields[name] = u
-                                    logs.append(f"Uploaded: {u}")
+                    ftype_current = ftype
+                    if isinstance(value, list):
+                        sep = "\n\n-----------\n\n"
+                        parts = []
+                        if TYPE_ALIASES.get(ftype_current, ftype_current) == "number":
+                            num_val = None
+                            for v in value:
+                                nv = _coerce_value(ftype_current, v)
+                                if isinstance(nv, (int, float)):
+                                    num_val = nv
+                                    break
+                            if num_val is not None:
+                                if isinstance(num_val, int) and abs(num_val) > MAX_SAFE_INT:
+                                    fallback_name = f"{name}文本"
+                                    field_types[fallback_name] = "text"
+                                    fields[fallback_name] = str(value[0] if len(value) > 0 else num_val)
+                                    logs.append(f"Number overflow fallback to text: {fallback_name}")
                                 else:
-                                    logs.append("Gitee Upload Failed")
+                                    fields[name] = num_val
                             else:
-                                if ftype == "url":
-                                    # URL 且无 Gitee，视频回退到附件，图片转 data-url
-                                    if _is_video_file(value):
-                                        fallback_name = f"{name}附件"
-                                        field_types[fallback_name] = "attachment"
-                                        fields[fallback_name] = [MediaItem(vb, fname)]
-                                        logs.append(f"Video URL fallback to attachment: {fallback_name}")
-                                    else:
-                                        du = self._image_bytes_to_data_url(vb)
-                                        if du:
-                                            fields[name] = du
-                                            logs.append("Fallback: data-url")
-                        except Exception as e:
-                            logs.append(f"File read error: {e}")
-                    # 兼容 ComfyUI LoadVideo/VHS 等节点的输出，可能是 dict 且包含 'filename' 或 'video_path'
-                    elif isinstance(value, dict) and ("filename" in value or "video_path" in value):
-                         try:
-                             v_path = value.get("video_path") or value.get("filename")
-                             v_sub = value.get("subfolder", "")
-                             v_type = value.get("type", "input")
-                             
-                             # 处理相对路径：尝试拼接 ComfyUI 目录
-                             real_path = v_path
-                             if v_path and not os.path.isabs(v_path):
-                                 real_path = folder_paths.get_annotated_filepath(v_path, v_sub) if hasattr(folder_paths, 'get_annotated_filepath') else None
-                                 if not real_path:
-                                      # Fallback
-                                      base = folder_paths.get_input_directory() if v_type == "input" else folder_paths.get_output_directory()
-                                      if v_sub:
-                                          base = os.path.join(base, v_sub)
-                                      real_path = os.path.join(base, v_path)
-                             
-                             if real_path and os.path.exists(real_path) and os.path.isfile(real_path):
-                                  with open(real_path, "rb") as f:
-                                     vb = f.read()
-                                  fname = os.path.basename(real_path)
-                                  if ftype == "attachment":
-                                      fields[name] = [MediaItem(vb, fname)]
-                                  elif has_gitee:
-                                      u = self._upload_file_gitee(vb, fname, config)
-                                      if u:
-                                          fields[name] = u
-                                          logs.append(f"Uploaded: {u}")
-                                      else:
-                                          logs.append("Gitee Upload Failed")
-                                  else:
-                                      if ftype == "url":
-                                          if _is_video_file(real_path):
-                                              fallback_name = f"{name}附件"
-                                              field_types[fallback_name] = "attachment"
-                                              fields[fallback_name] = [MediaItem(vb, fname)]
-                                              logs.append(f"Video URL fallback to attachment: {fallback_name}")
-                                          else:
-                                              du = self._image_bytes_to_data_url(vb)
-                                              if du:
-                                                  fields[name] = du
-                                                  logs.append("Fallback: data-url")
-                             else:
-                                 logs.append(f"Video file not found: {v_path}")
-                         except Exception as e:
-                             logs.append(f"Video dict read error: {e}")
-                    # 兼容 ComfyUI VideoInput 对象 (如 VideoFromFile, VideoFromComponents)
-                    elif hasattr(value, "get_stream_source"):
-                        try:
-                            source = value.get_stream_source()
-                            
-                            if isinstance(source, str):
-                                # 返回的是文件路径
-                                v_path = source
-                                # 处理相对路径
-                                real_path = v_path
-                                if v_path and not os.path.isabs(v_path):
-                                    real_path = folder_paths.get_annotated_filepath(v_path) if hasattr(folder_paths, 'get_annotated_filepath') else None
-                                    if not real_path:
-                                        # Fallback
-                                        base = folder_paths.get_input_directory()
-                                        real_path = os.path.join(base, v_path)
-                                
-                                if real_path and os.path.exists(real_path) and os.path.isfile(real_path):
-                                    with open(real_path, "rb") as f:
-                                        vb = f.read()
-                                    fname = os.path.basename(real_path)
-                                    if ftype == "attachment":
-                                        fields[name] = [MediaItem(vb, fname)]
-                                    elif has_gitee:
-                                        u = self._upload_file_gitee(vb, fname, config)
-                                        if u:
-                                            fields[name] = u
-                                            logs.append(f"Uploaded: {u}")
-                                        else:
-                                            logs.append("Gitee Upload Failed")
-                                    else:
-                                        if ftype == "url":
-                                            if _is_video_file(real_path):
-                                                fallback_name = f"{name}附件"
-                                                field_types[fallback_name] = "attachment"
-                                                fields[fallback_name] = [MediaItem(vb, fname)]
-                                                logs.append(f"Video URL fallback to attachment: {fallback_name}")
-                                            else:
-                                                du = self._image_bytes_to_data_url(vb)
-                                                if du:
-                                                    fields[name] = du
-                                                    logs.append("Fallback: data-url")
+                                logs.append(f"Number convert fail: {name}")
+                        else:
+                            for v in value:
+                                if _is_url_string(v):
+                                    parts.append(v.strip())
                                 else:
-                                    logs.append(f"Video file not found: {v_path}")
-                            
-                            else:
-                                # 返回的是 BytesIO 或类似对象 (例如 VideoFromComponents)
-                                if hasattr(source, "getvalue"):
-                                    vb = source.getvalue()
-                                else:
-                                    source.seek(0)
-                                    vb = source.read()
-                                
-                                # 默认为 mp4，因为我们无法轻易得知具体格式，除非解析 container header
-                                fname = f"video_{uuid.uuid4().hex}.mp4"
-                                
-                                if ftype == "attachment":
-                                    fields[name] = [MediaItem(vb, fname)]
-                                elif has_gitee:
-                                    u = self._upload_file_gitee(vb, fname, config)
-                                    if u:
-                                        fields[name] = u
-                                        logs.append(f"Uploaded: {u}")
-                                    else:
-                                        logs.append("Gitee Upload Failed")
-                                else:
-                                    if ftype == "url":
-                                        # 既然是流数据，我们假设它是视频
-                                        fallback_name = f"{name}附件"
-                                        field_types[fallback_name] = "attachment"
-                                        fields[fallback_name] = [MediaItem(vb, fname)]
-                                        logs.append(f"Video stream fallback to attachment: {fallback_name}")
-                                        
-                        except Exception as e:
-                            logs.append(f"Video object read error: {e}")
-                    
-                    # 兼容 ComfyUI 对象类型 (旧版兼容，或无 get_stream_source)
-                    elif hasattr(value, "file_path") or hasattr(value, "path") or hasattr(value, "filename"):
-                        try:
-                            # 优先尝试获取 file_path (ComfyUI VideoFromFile 的真实属性)，其次 path/filename
-                            v_path = getattr(value, "file_path", None) or getattr(value, "path", None) or getattr(value, "filename", None)
-                            v_sub = getattr(value, "subfolder", "")
-                            v_type = getattr(value, "type", "input")
-                            
-                            # 处理相对路径：尝试拼接 ComfyUI 目录
-                            real_path = v_path
-                            if v_path and not os.path.isabs(v_path):
-                                real_path = folder_paths.get_annotated_filepath(v_path, v_sub) if hasattr(folder_paths, 'get_annotated_filepath') else None
-                                if not real_path:
-                                    # Fallback
-                                    base = folder_paths.get_input_directory() if v_type == "input" else folder_paths.get_output_directory()
-                                    if v_sub:
-                                        base = os.path.join(base, v_sub)
-                                    real_path = os.path.join(base, v_path)
-                            
-                            if real_path and os.path.exists(real_path) and os.path.isfile(real_path):
-                                with open(real_path, "rb") as f:
-                                    vb = f.read()
-                                fname = os.path.basename(real_path)
-                                if ftype == "attachment":
-                                    fields[name] = [MediaItem(vb, fname)]
-                                elif has_gitee:
-                                    u = self._upload_file_gitee(vb, fname, config)
-                                    if u:
-                                        fields[name] = u
-                                        logs.append(f"Uploaded: {u}")
-                                    else:
-                                        logs.append("Gitee Upload Failed")
-                                else:
-                                    if ftype == "url":
-                                        if _is_video_file(real_path):
-                                            fallback_name = f"{name}附件"
-                                            field_types[fallback_name] = "attachment"
-                                            fields[fallback_name] = [MediaItem(vb, fname)]
-                                            logs.append(f"Video URL fallback to attachment: {fallback_name}")
-                                        else:
-                                            du = self._image_bytes_to_data_url(vb)
-                                            if du:
-                                                fields[name] = du
-                                                logs.append("Fallback: data-url")
-                            else:
-                                logs.append(f"Video object file not found: {v_path}")
-                        except Exception as e:
-                            logs.append(f"Video object read error: {e}")
+                                    s = str(v)
+                                    if s.strip(): parts.append(s)
+                            fields[name] = sep.join(parts) if parts else ""
                     else:
-                        try:
-                            if is_image_like(value) and hasattr(value, "shape") and len(value.shape) == 4 and int(value.shape[0]) > 1:
-                                if ftype == "attachment":
-                                    attachments = []
-                                    for b in range(int(value.shape[0])):
-                                        ib = self._tensor_to_bytes(value[b:b+1])
-                                        attachments.append(ib)
-                                    fields[name] = attachments
-                                else:
-                                    urls = []
-                                    for b in range(int(value.shape[0])):
-                                        ib = self._tensor_to_bytes(value[b:b+1])
-                                        if has_gitee:
-                                            u = self._upload_image_gitee(ib, config)
-                                            if u:
-                                                urls.append(u)
-                                                logs.append(f"Uploaded: {u}")
-                                            elif config.get("gitee_token"):
-                                                logs.append("Gitee Upload Failed")
-                                            if not u:
-                                                du = self._image_bytes_to_data_url(ib)
-                                                if du:
-                                                    urls.append(du)
-                                                    logs.append("Fallback: data-url")
-                                        else:
-                                            du = self._image_bytes_to_data_url(ib)
-                                            if du:
-                                                urls.append(du)
-                                                logs.append("Fallback: data-url")
-                                    if urls:
-                                        if ftype == "url":
-                                            if has_gitee:
-                                                fields[name] = "\n".join(urls)
-                                            else:
-                                                # 无图床时，URL列改为写附件到“列名附件”
-                                                fallback_name = f"{name}附件"
-                                                field_types[fallback_name] = "attachment"
-                                                att_single = []
-                                                try:
-                                                    for b in range(int(value.shape[0])):
-                                                        ibb = self._tensor_to_bytes(value[b:b+1])
-                                                        att_single.append(ibb)
-                                                except Exception:
-                                                    pass
-                                                if att_single:
-                                                    fields[fallback_name] = att_single
-                                                    logs.append(f"URL fallback to attachment: {fallback_name}")
-                                        else:
-                                            fields[name] = "\n".join(urls)
-                            else:
-                                ib = _value_to_image_bytes(value)
-                                if ib:
-                                    if ftype == "attachment":
-                                        fields[name] = [ib]
-                                    elif has_gitee:
-                                        u = self._upload_image_gitee(ib, config)
-                                        if u:
-                                            fields[name] = u
-                                            logs.append(f"Uploaded: {u}")
-                                        elif config.get("gitee_token"):
-                                            logs.append("Gitee Upload Failed")
-                                        if not u:
-                                            du = self._image_bytes_to_data_url(ib)
-                                            if du:
-                                                if ftype == "url":
-                                                    # 无图床：改为附件列
-                                                    fallback_name = f"{name}附件"
-                                                    field_types[fallback_name] = "attachment"
-                                                    fields[fallback_name] = [ib]
-                                                    logs.append(f"URL fallback to attachment: {fallback_name}")
-                                                else:
-                                                    fields[name] = du
-                                                logs.append("Fallback: data-url")
-                                    else:
-                                        du = self._image_bytes_to_data_url(ib)
-                                        if du:
-                                            if ftype == "url":
-                                                fallback_name = f"{name}附件"
-                                                field_types[fallback_name] = "attachment"
-                                                fields[fallback_name] = [ib]
-                                                logs.append(f"URL fallback to attachment: {fallback_name}")
-                                            else:
-                                                fields[name] = du
-                                            logs.append("Fallback: data-url")
-                                else:
-                                    fields[name] = str(value)
-                        except Exception:
-                            fields[name] = str(value)
-            else:
-                # 非附件/URL类型
-                ftype_current = field_types.get(name, "text")
-                if isinstance(value, list):
-                    sep = "\n\n-----------\n\n"
-                    parts = []
-                    if TYPE_ALIASES.get(ftype_current, ftype_current) == "number":
-                        # 列表取首个可转换的数字
-                        num_val = None
-                        for v in value:
-                            nv = _coerce_value(ftype_current, v)
-                            if isinstance(nv, (int, float)):
-                                num_val = nv
-                                break
-                        if num_val is not None:
-                            if isinstance(num_val, int) and abs(num_val) > MAX_SAFE_INT:
+                        val = _coerce_value(ftype_current, value)
+                        if val is not None:
+                             if TYPE_ALIASES.get(ftype_current, ftype_current) == "number" and isinstance(val, int) and abs(val) > MAX_SAFE_INT:
                                 fallback_name = f"{name}文本"
                                 field_types[fallback_name] = "text"
-                                fields[fallback_name] = str(value[0] if len(value) > 0 else num_val)
+                                fields[fallback_name] = str(value)
                                 logs.append(f"Number overflow fallback to text: {fallback_name}")
-                            else:
-                                fields[name] = num_val
+                             else:
+                                fields[name] = val
                         else:
-                            logs.append(f"Number convert fail: {name}")
-                    else:
-                        for v in value:
-                            if _is_url_string(v):
-                                s = v.strip()
-                                if s:
-                                    parts.append(s)
-                            elif is_image_like(v):
-                                try:
-                                    if hasattr(v, "shape") and len(v.shape) == 4 and int(v.shape[0]) > 1:
-                                        for b in range(int(v.shape[0])):
-                                            ib = self._tensor_to_bytes(v[b:b+1])
-                                            if ib:
-                                                if bool(config.get("gitee_token")) and bool(config.get("gitee_owner")) and bool(config.get("gitee_repo")):
-                                                    u = self._upload_image_gitee(ib, config)
-                                                    if u:
-                                                        parts.append(u)
-                                                        logs.append(f"Uploaded: {u}")
-                                                    elif config.get("gitee_token"):
-                                                        logs.append("Gitee Upload Failed")
-                                                    if not u:
-                                                        du = self._image_bytes_to_data_url(ib)
-                                                        if du:
-                                                            parts.append(du)
-                                                            logs.append("Fallback: data-url")
-                                                else:
-                                                    du = self._image_bytes_to_data_url(ib)
-                                                    if du:
-                                                        parts.append(du)
-                                                        logs.append("Fallback: data-url")
-                                    else:
-                                        ib = _value_to_image_bytes(v)
-                                        if ib:
-                                            if bool(config.get("gitee_token")) and bool(config.get("gitee_owner")) and bool(config.get("gitee_repo")):
-                                                u = self._upload_image_gitee(ib, config)
-                                                if u:
-                                                    parts.append(u)
-                                                    logs.append(f"Uploaded: {u}")
-                                                elif config.get("gitee_token"):
-                                                    logs.append("Gitee Upload Failed")
-                                                if not u:
-                                                    du = self._image_bytes_to_data_url(ib)
-                                                    if du:
-                                                        parts.append(du)
-                                                        logs.append("Fallback: data-url")
-                                            else:
-                                                du = self._image_bytes_to_data_url(ib)
-                                                if du:
-                                                    parts.append(du)
-                                                    logs.append("Fallback: data-url")
-                                except Exception:
-                                    s = str(v)
-                                    if s.strip():
-                                        parts.append(s)
-                            else:
-                                s = str(v)
-                                if s.strip():
-                                    parts.append(s)
-                        fields[name] = sep.join(parts) if parts else ""
-                else:
-                    val = _coerce_value(ftype_current, value)
-                    if val is not None:
-                        if TYPE_ALIASES.get(ftype_current, ftype_current) == "number" and isinstance(val, int) and abs(val) > MAX_SAFE_INT:
-                            fallback_name = f"{name}文本"
-                            field_types[fallback_name] = "text"
-                            fields[fallback_name] = str(value)
-                            logs.append(f"Number overflow fallback to text: {fallback_name}")
-                        else:
-                            fields[name] = val
-                    else:
-                        logs.append(f"Value convert fail: {name}")
+                            logs.append(f"Value convert fail: {name}")
+            
+            return fields, field_types
 
-        items = config.get("bitable_items", [])
-        print(f"[FeishuBitable] bitable_items count={len(items)}")
-
-        def push_one(app_token, table_id, v_id, record_idx=0, record_action="append", match_field=None, match_value=None, record_id_val=None):
+        def push_one(app_token, table_id, v_id, record_idx, record_action, match_field, match_value, record_id_val, fields, field_types):
             client = FeishuBitableClient(config.get("feishu_app_id"), config.get("feishu_app_secret"))
             resolved_app_token = client.resolve_app_token(app_token, table_id)
             if resolved_app_token != app_token:
                 print(f"[FeishuBitable] app_token resolved to: {resolved_app_token}")
-            required = []
-            # 1. 先把 explicit 的配置加进去，构建一个名字集合
-            _explicit_names = set()
-            for f in extra_fields:
-                if f.get("name"):
-                    required.append({"name": f.get("name"), "type": f.get("type", "text")})
-                    _explicit_names.add(f.get("name"))
             
-            # 2. 再把 fields 里生成出来的 key 加进去，如果还没加过的话
+            required = []
             for k in fields.keys():
-                if k not in _explicit_names:
-                    # 优先从 field_types 获取类型（这里包含了 fallback 的附件列类型）
-                    ft = field_types.get(k, "text")
-                    required.append({"name": k, "type": ft})
+                ft = field_types.get(k, "text")
+                required.append({"name": k, "type": ft})
             created = client.ensure_fields(resolved_app_token, table_id, required)
             for n, c, t in created:
                 if c in (200, 201):
                     logs.append(f"Field Created: {n}")
-                    print(f"[FeishuBitable] Field Created: {n}")
                 else:
                     logs.append(f"Field Create Fail[{n}]: {c} {t}")
-                    print(f"[FeishuBitable] Field Create Fail[{n}]: {c} {t}")
-            # 将字段名转换为 field_id，再写入记录
+            
             name_to_id = client.list_fields_map(resolved_app_token, table_id)
             fields_info = client.list_fields_info(resolved_app_token, table_id)
             print(f"[FeishuBitable] name_to_id size={len(name_to_id)}")
-            # 仅按现有“列名”过滤，发送字段名 -> 值，避免 1254045（要求 field_name）
+            
             fields_payload = {}
             if name_to_id:
                 for k, v in fields.items():
@@ -1622,6 +1650,7 @@ class FeishuBitablePushNode:
                                         logs.append(f"Attachment Uploaded: {ftok}")
                                 except Exception as e:
                                     logs.append(f"Attachment Upload Error: {str(e)}")
+                            
                             target_name = k
                             try:
                                 finfo = fields_info.get(k, {})
@@ -1631,42 +1660,26 @@ class FeishuBitablePushNode:
                                         sc, st = client.create_field(resolved_app_token, table_id, target_name, "attachment")
                                         logs.append(f"Auto Create Attachment Field[{target_name}]: {sc}")
                                         if sc in (200, 201):
-                                            # 解析返回的 field_id
                                             try:
                                                 import time
-                                                time.sleep(0.5) # 等待字段创建生效
+                                                time.sleep(0.5)
                                                 rj = json.loads(st)
                                                 fid = rj.get("data", {}).get("field", {}).get("field_id")
                                                 if fid:
                                                     target_name = fid
-                                                    print(f"[FeishuBitable] Use new field_id: {fid}")
                                             except Exception:
                                                 pass
-                                            # 刷新映射
                                             name_to_id = client.list_fields_map(resolved_app_token, table_id)
                                             fields_info = client.list_fields_info(resolved_app_token, table_id)
-                            except Exception as e:
-                                logs.append(f"Attachment Field Check Error: {str(e)}")
+                            except Exception:
+                                pass
+                            
                             if tokens:
                                 fields_payload[target_name] = tokens
                         else:
-                            if v is not None:
-                                try:
-                                    ftk = field_types.get(k, "text")
-                                    ftk = TYPE_ALIASES.get(ftk, ftk)
-                                    if ftk == "number":
-                                        vn = _coerce_value(ftk, v)
-                                        if vn is None:
-                                            logs.append(f"Skip non-number value: {k}")
-                                            continue
-                                        fields_payload[k] = vn
-                                    else:
-                                        fields_payload[k] = v
-                                except Exception:
-                                    fields_payload[k] = v
+                            fields_payload[k] = v
                     else:
-                        # 新列未存在但我们要写附件：自动创建后写入
-                        if isinstance(v, list) and v and (isinstance(v[0], (bytes, bytearray)) or isinstance(v[0], MediaItem)) and field_types.get(k) == "attachment":
+                         if isinstance(v, list) and v and (isinstance(v[0], (bytes, bytearray)) or isinstance(v[0], MediaItem)) and field_types.get(k) == "attachment":
                             sc, st = client.create_field(resolved_app_token, table_id, k, "attachment")
                             logs.append(f"Auto Create Attachment Field[{k}]: {sc}")
                             target_key = k
@@ -1676,13 +1689,8 @@ class FeishuBitablePushNode:
                                     time.sleep(0.5)
                                     rj = json.loads(st)
                                     fid = rj.get("data", {}).get("field", {}).get("field_id")
-                                    if fid:
-                                        target_key = fid
-                                        print(f"[FeishuBitable] Use new field_id: {fid}")
-                                except Exception:
-                                    pass
-                                name_to_id = client.list_fields_map(resolved_app_token, table_id)
-                                fields_info = client.list_fields_info(resolved_app_token, table_id)
+                                    if fid: target_key = fid
+                                except Exception: pass
                                 tokens = []
                                 for ib in v:
                                     try:
@@ -1690,86 +1698,44 @@ class FeishuBitablePushNode:
                                             ftok = client.upload_file(resolved_app_token, ib.data, ib.filename)
                                         else:
                                             ftok = client.upload_attachment(resolved_app_token, ib, f"image_{uuid.uuid4().hex}.png")
-                                        if ftok:
-                                            tokens.append({"file_token": ftok})
-                                            logs.append(f"Attachment Uploaded: {ftok}")
-                                    except Exception as e:
-                                        logs.append(f"Attachment Upload Error: {str(e)}")
-                                if tokens:
-                                    fields_payload[target_key] = tokens
-                        else:
-                            # 非附件类型的新列，直接尝试创建文本列
-                            sc, st = client.create_field(resolved_app_token, table_id, k, field_types.get(k, "text"))
-                            logs.append(f"Auto Create Field[{k}]: {sc}")
-                            target_key = k
-                            if sc in (200, 201):
-                                try:
-                                    import time
-                                    time.sleep(0.5)
-                                    rj = json.loads(st)
-                                    fid = rj.get("data", {}).get("field", {}).get("field_id")
-                                    if fid:
-                                        target_key = fid
-                                        print(f"[FeishuBitable] Use new field_id: {fid}")
-                                except Exception:
-                                    pass
-                                name_to_id = client.list_fields_map(resolved_app_token, table_id)
-                                fields_info = client.list_fields_info(resolved_app_token, table_id)
-                                try:
-                                    ftk = field_types.get(k, "text")
-                                    ftk = TYPE_ALIASES.get(ftk, ftk)
-                                    if ftk == "number":
-                                        vn = _coerce_value(ftk, v)
-                                        if vn is None:
-                                            logs.append(f"Skip non-number value: {k}")
-                                        else:
-                                            fields_payload[target_key] = vn
-                                    else:
-                                        fields_payload[target_key] = v
-                                except Exception:
-                                    fields_payload[target_key] = v
-                print(f"[FeishuBitable] payload_by_name_filtered count={len(fields_payload)}")
+                                        if ftok: tokens.append({"file_token": ftok})
+                                    except Exception: pass
+                                if tokens: fields_payload[target_key] = tokens
+                         else:
+                             pass
             else:
                 fields_payload = fields
-                print(f"[FeishuBitable] payload_by_name count={len(fields_payload)}")
+            
+            print(f"[FeishuBitable] payload_by_name_filtered count={len(fields_payload)}")
+            
             def _as_rich_text(v):
                 s = str(v or "")
                 return [{"text": s, "type": "text"}] if len(s) > 0 else []
             def _to_rich_payload(p):
                 rp = {}
                 for k, v in p.items():
-                    if isinstance(v, str):
-                        rp[k] = _as_rich_text(v)
-                    else:
-                        rp[k] = v
+                    if isinstance(v, str): rp[k] = _as_rich_text(v)
+                    else: rp[k] = v
                 return rp
+
             target_record_id = None
             should_update = False
             
             if record_action == "update_index" and record_idx > 0:
                 print(f"[FeishuBitable] Attempting update for row {record_idx}")
-                # 查找指定行号的 record_id
-                # 分页查找，每页 100 条
                 curr_idx = 0
                 pg_token = None
                 while True:
                     recs = client.list_records(resolved_app_token, table_id, v_id if (v_id or "").strip() else None, 100, pg_token)
-                    if not recs:
-                        break
+                    if not recs or not recs.get("items"): break
                     items_list = recs.get("items", [])
-                    if not items_list:
-                        break
-                    
                     if curr_idx + len(items_list) >= record_idx:
-                        # 找到了
                         offset = record_idx - curr_idx - 1
                         if 0 <= offset < len(items_list):
                             target_record_id = items_list[offset].get("record_id")
                         break
-                    
                     curr_idx += len(items_list)
-                    if not recs.get("has_more"):
-                        break
+                    if not recs.get("has_more"): break
                     pg_token = recs.get("page_token")
                 
                 if target_record_id:
@@ -1777,7 +1743,6 @@ class FeishuBitablePushNode:
                     logs.append(f"Found record[{record_idx}]: {target_record_id}")
                 else:
                     logs.append(f"Record[{record_idx}] not found, skip update")
-                    print(f"[FeishuBitable] Record index {record_idx} not found")
                     return
             elif record_action == "update_id" and record_id_val:
                 print(f"[FeishuBitable] Attempting update by ID: {record_id_val}")
@@ -1785,31 +1750,18 @@ class FeishuBitablePushNode:
                 should_update = True
             elif record_action == "update_match" and match_field:
                 print(f"[FeishuBitable] Attempting match update: {match_field} = {match_value}")
-                # 使用 filter 查找
-                # 构造 filter string: CurrentValue.[Field] = "Value"
-                # 注意 value 需要转义双引号
                 safe_val = str(match_value or "").replace('"', '\\"')
                 filter_str = f'CurrentValue.[{match_field}] = "{safe_val}"'
-                
                 recs = client.list_records(resolved_app_token, table_id, v_id if (v_id or "").strip() else None, 20, None, filter=filter_str)
                 if recs and recs.get("items"):
-                    items_list = recs.get("items")
-                    target_record_id = items_list[0].get("record_id")
+                    target_record_id = recs.get("items")[0].get("record_id")
                     should_update = True
                     logs.append(f"Match found: {target_record_id}")
                 else:
                     logs.append(f"Match not found, append new")
 
-
             try:
                 print(f"[FeishuBitable] Sending {'update' if should_update else 'create'}_record. Fields keys: {list(fields_payload.keys())}")
-                # 序列化检查
-                json_body = json.dumps({"fields": fields_payload})
-                # print(f"[FeishuBitable] Payload preview: {json_body[:500]}")
-            except Exception as e:
-                print(f"[FeishuBitable] Payload serialization error: {e}")
-            
-            try:
                 if should_update:
                     http_status, text = client.update_record(resolved_app_token, table_id, target_record_id, fields_payload)
                 else:
@@ -1817,6 +1769,7 @@ class FeishuBitablePushNode:
             except Exception as e:
                 logs.append(f"{'Update' if should_update else 'Create'} record error: {str(e)}")
                 http_status, text = 0, str(e)
+            
             success = False
             need_retry_rich = False
             try:
@@ -1826,8 +1779,8 @@ class FeishuBitablePushNode:
                 need_retry_rich = (http_status in (200, 201)) and (api_code == 1254002)
                 print(f"[FeishuBitable] Push http={http_status} api_code={api_code}")
             except Exception:
-                print(f"[FeishuBitable] Push http={http_status} body_not_json")
                 success = http_status in (200, 201)
+            
             if (not success) and need_retry_rich:
                 rich_payload = _to_rich_payload(fields_payload)
                 try:
@@ -1836,15 +1789,13 @@ class FeishuBitablePushNode:
                     else:
                         http_status, text = client.create_record(resolved_app_token, table_id, rich_payload, v_id if (v_id or "").strip() else None)
                 except Exception as e:
-                    logs.append(f"{'Update' if should_update else 'Create'} record retry error: {str(e)}")
                     http_status, text = 0, str(e)
                 try:
                     j = json.loads(text)
-                    api_code = j.get("code", -1)
-                    success = (http_status in (200, 201)) and (api_code == 0)
-                    print(f"[FeishuBitable] Retry http={http_status} api_code={api_code}")
+                    success = (http_status in (200, 201)) and (j.get("code", -1) == 0)
                 except Exception:
                     success = http_status in (200, 201)
+            
             if success:
                 logs.append(f"Feishu Bitable[{table_id}]: OK")
             else:
@@ -1852,20 +1803,12 @@ class FeishuBitablePushNode:
 
         if items:
             for it in items:
-                # 兼容 record_index 可能是 None 或空
                 ridx = 0
                 raction = it.get("record_action", "append")
-                try:
-                    ridx = int(it.get("record_index") or 0)
-                except:
-                    ridx = 0
+                try: ridx = int(it.get("record_index") or 0)
+                except: ridx = 0
                 
-                # 兼容旧配置：如果直接在 config 里写了 record_index 但没有 action
                 if ridx > 0 and raction == "append" and "record_action" not in it:
-                     # 此时可能是旧的配置节点传递过来的（虽然旧配置节点已经移除了 record_index，但为了向后兼容逻辑）
-                     # 或者用户通过其他方式注入了 record_index
-                     # 但由于我们从 ConfigNode 移除了 record_index，这里主要是为了健壮性
-                     # 如果 bitable_items 里有 record_index 且 > 0，那应该是 update_index
                      raction = "update_index"
                 
                 app_token_val = it.get("app_token", "")
@@ -1873,17 +1816,19 @@ class FeishuBitablePushNode:
                 if not (app_token_val and table_id_val):
                      logs.append(f"Skip item: missing token/table")
                      continue
-
-                push_one(app_token_val, table_id_val, it.get("view_id", ""), ridx, raction, it.get("match_field"), it.get("match_value"), it.get("record_id"))
+                
+                p_fields, p_types = process_fields(it.get("fields", {}), it.get("field_types", {}))
+                
+                push_one(app_token_val, table_id_val, it.get("view_id", ""), ridx, raction, it.get("match_field"), it.get("match_value"), it.get("record_id"), p_fields, p_types)
         else:
-            # 兼容老参数：当未使用配置节点时，允许直接填写
             app_token = config.get("bitable_app_token", "") or ""
             table_id = config.get("bitable_table_id", "") or ""
             if not (app_token and table_id):
                 logs.append("No Bitable target in config")
                 print("[FeishuBitable] No Bitable target in config")
             else:
-                push_one(app_token, table_id, "", 0, "append", None, None, None)
+                # Should not happen as we convert legacy fields to items at the top
+                pass
 
         return (" | ".join(logs),)
 
