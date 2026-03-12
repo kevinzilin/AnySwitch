@@ -504,10 +504,15 @@ class FeishuBitableClient:
             return None
         if not filename:
             filename = f"{uuid.uuid4().hex}.png"
+        image_size = len(image_bytes)
+        if image_size > 20 * 1024 * 1024:
+            ft_chunk = self._upload_media_chunked(app_token, image_bytes, filename, "bitable_image", t=t)
+            if ft_chunk:
+                return ft_chunk
         url = "https://open.feishu.cn/open-apis/drive/v1/medias/upload_all"
         headers = {"Authorization": f"Bearer {t}"}
         files = {"file": (filename, image_bytes, "image/png")}
-        data = {"file_name": filename, "parent_type": "bitable_image", "parent_node": app_token, "size": str(len(image_bytes))}
+        data = {"file_name": filename, "parent_type": "bitable_image", "parent_node": app_token, "size": str(image_size)}
         try:
             res = requests.post(url, headers=headers, files=files, data=data, timeout=30)
             j = res.json()
@@ -521,6 +526,75 @@ class FeishuBitableClient:
             print(f"[FeishuBitable] Upload attachment error: {e}")
         return None
 
+    def _upload_media_chunked(self, app_token, file_bytes, filename, parent_type, t=None):
+        if self._mock:
+            print("[FeishuBitable][MOCK] Chunked upload media")
+            return "box_mock_token_chunked"
+        if not t:
+            t = self.get_token()
+        if not t:
+            return None
+        file_size = len(file_bytes)
+        print(f"[FeishuBitable] Start chunked upload for {filename} ({file_size} bytes) parent_type={parent_type}")
+        try:
+            url_prepare = "https://open.feishu.cn/open-apis/drive/v1/medias/upload_prepare"
+            headers_json = {"Authorization": f"Bearer {t}", "Content-Type": "application/json"}
+            data_prepare = {
+                "file_name": filename,
+                "parent_type": parent_type,
+                "parent_node": app_token,
+                "size": file_size
+            }
+            res_prep = requests.post(url_prepare, headers=headers_json, json=data_prepare, timeout=30)
+            j_prep = res_prep.json()
+            if res_prep.status_code != 200 or j_prep.get("code") != 0:
+                print(f"[FeishuBitable] Upload prepare fail: {res_prep.text[:200]}")
+                return None
+            prep_data = j_prep.get("data", {}) or {}
+            upload_id = prep_data.get("upload_id")
+            block_size = prep_data.get("block_size") or (4 * 1024 * 1024)
+            block_num = prep_data.get("block_num")
+            if not upload_id:
+                print(f"[FeishuBitable] Upload prepare missing upload_id: {str(j_prep)[:200]}")
+                return None
+            if not isinstance(block_num, int) or block_num <= 0:
+                try:
+                    block_num = int((file_size + block_size - 1) // block_size)
+                except Exception:
+                    block_num = 1
+            print(f"[FeishuBitable] Upload prepare OK: upload_id={upload_id} block_size={block_size} blocks={block_num}")
+
+            url_part = "https://open.feishu.cn/open-apis/drive/v1/medias/upload_part"
+            headers_part = {"Authorization": f"Bearer {t}"}
+
+            for i in range(block_num):
+                start = i * block_size
+                end = min((i + 1) * block_size, file_size)
+                chunk_data = file_bytes[start:end]
+                files_part = {"file": (filename, chunk_data)}
+                data_part = {"upload_id": upload_id, "seq": str(i), "size": str(len(chunk_data))}
+                print(f"[FeishuBitable] Uploading part {i+1}/{block_num} ({len(chunk_data)} bytes)...")
+                res_part = requests.post(url_part, headers=headers_part, files=files_part, data=data_part, timeout=120)
+                j_part = res_part.json()
+                if res_part.status_code != 200 or j_part.get("code") != 0:
+                    print(f"[FeishuBitable] Upload part {i} fail: {res_part.text[:200]}")
+                    return None
+
+            url_finish = "https://open.feishu.cn/open-apis/drive/v1/medias/upload_finish"
+            data_finish = {"upload_id": upload_id, "block_num": block_num}
+            res_fin = requests.post(url_finish, headers=headers_json, json=data_finish, timeout=60)
+            j_fin = res_fin.json()
+            if res_fin.status_code == 200 and j_fin.get("code") == 0:
+                ft = j_fin.get("data", {}).get("file_token")
+                if ft:
+                    print(f"[FeishuBitable] Upload finish OK: {ft}")
+                    return ft
+            print(f"[FeishuBitable] Upload finish fail: {res_fin.text[:200]}")
+            return None
+        except Exception as e:
+            print(f"[FeishuBitable] Chunked upload error: {e}")
+            return None
+
     def upload_file(self, app_token, file_bytes, filename=None):
         if self._mock:
             print("[FeishuBitable][MOCK] Upload file")
@@ -530,78 +604,7 @@ class FeishuBitableClient:
             return None
         if not filename:
             filename = f"{uuid.uuid4().hex}.bin"
-        
-        file_size = len(file_bytes)
-        # 飞书建议超过 20MB 使用分片上传
-        # 这里强制使用分片上传，以避免 bitable_file 在 upload_all 接口下的潜在兼容性问题
-        # CHUNK_SIZE = 20 * 1024 * 1024 
-        
-        # 分片上传
-        print(f"[FeishuBitable] Start chunked upload for {filename} ({file_size} bytes)")
-        # 1. 预上传
-        try:
-            url_prepare = "https://open.feishu.cn/open-apis/drive/v1/medias/upload_prepare"
-            headers = {"Authorization": f"Bearer {t}", "Content-Type": "application/json"}
-            data_prepare = {
-                "file_name": filename,
-                "parent_type": "bitable_file",
-                "parent_node": app_token,
-                "size": file_size
-            }
-            res_prep = requests.post(url_prepare, headers=headers, json=data_prepare, timeout=30)
-            j_prep = res_prep.json()
-            if res_prep.status_code != 200 or j_prep.get("code") != 0:
-                print(f"[FeishuBitable] Upload prepare fail: {res_prep.text[:200]}")
-                return None
-            upload_id = j_prep.get("data", {}).get("upload_id")
-            block_size = j_prep.get("data", {}).get("block_size", 4 * 1024 * 1024) # 默认 4MB
-            block_num = j_prep.get("data", {}).get("block_num")
-            print(f"[FeishuBitable] Upload prepare OK: upload_id={upload_id} block_size={block_size} blocks={block_num}")
-            
-            # 2. 分片上传
-            url_part = "https://open.feishu.cn/open-apis/drive/v1/medias/upload_part"
-            
-            for i in range(block_num):
-                start = i * block_size
-                end = min((i + 1) * block_size, file_size)
-                chunk_data = file_bytes[start:end]
-                
-                # upload_part 是 form-data
-                # 字段: upload_id, seq (从0开始), size (分片大小), file (二进制)
-                files_part = {"file": (filename, chunk_data)}
-                data_part = {
-                    "upload_id": upload_id,
-                    "seq": str(i),
-                    "size": str(len(chunk_data))
-                }
-                headers_part = {"Authorization": f"Bearer {t}"} # multipart/form-data 不需要手动设置 Content-Type
-                
-                print(f"[FeishuBitable] Uploading part {i+1}/{block_num} ({len(chunk_data)} bytes)...")
-                res_part = requests.post(url_part, headers=headers_part, files=files_part, data=data_part, timeout=120)
-                j_part = res_part.json()
-                if res_part.status_code != 200 or j_part.get("code") != 0:
-                    print(f"[FeishuBitable] Upload part {i} fail: {res_part.text[:200]}")
-                    return None
-            
-            # 3. 完成上传
-            url_finish = "https://open.feishu.cn/open-apis/drive/v1/medias/upload_finish"
-            data_finish = {
-                "upload_id": upload_id,
-                "block_num": block_num
-            }
-            res_fin = requests.post(url_finish, headers=headers, json=data_finish, timeout=60)
-            j_fin = res_fin.json()
-            if res_fin.status_code == 200 and j_fin.get("code") == 0:
-                ft = j_fin.get("data", {}).get("file_token")
-                if ft:
-                    print(f"[FeishuBitable] Upload finish OK: {ft}")
-                    return ft
-            print(f"[FeishuBitable] Upload finish fail: {res_fin.text[:200]}")
-            return None
-            
-        except Exception as e:
-            print(f"[FeishuBitable] Chunked upload error: {e}")
-            return None
+        return self._upload_media_chunked(app_token, file_bytes, filename, "bitable_file", t=t)
 
 
 class FeishuBitableConfigNode:
