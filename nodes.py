@@ -1,4 +1,6 @@
 from comfy_execution.graph import ExecutionBlocker
+import json
+import re
 
 class AnyType(str):
     """A special type that compares equal to any other type."""
@@ -111,3 +113,90 @@ class AnyIsEmpty:
             pass
             
         return (False,)
+
+class AnyJsonGet:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "json输入": (ANY,),
+                "路径": ("STRING", {"default": "", "tooltip": "支持：results / results[0] / results[0].file_token / results[0].data.name"}),
+            },
+            "optional": {
+                "默认值": (ANY,),
+            }
+        }
+
+    RETURN_TYPES = ("BOOLEAN", ANY, "STRING")
+    RETURN_NAMES = ("是否找到", "值", "值(JSON)")
+    FUNCTION = "get"
+    CATEGORY = "maoyu/utils"
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, input_types):
+        return True
+
+    def _parse_path(self, path_text: str):
+        s = str(path_text or "").strip()
+        if not s:
+            return []
+        parts = s.split(".")
+        tokens = []
+        for p in parts:
+            p = p.strip()
+            if not p:
+                continue
+            m = re.match(r"^([^\[\]]+)(.*)$", p)
+            if not m:
+                continue
+            key = m.group(1).strip()
+            rest = m.group(2) or ""
+            if key:
+                tokens.append(("key", key))
+            for mi in re.finditer(r"\[(\d+)\]", rest):
+                tokens.append(("index", int(mi.group(1))))
+        return tokens
+
+    def _to_obj(self, v):
+        if isinstance(v, (dict, list)):
+            return v, True, ""
+        if isinstance(v, str):
+            t = v.strip()
+            if t == "":
+                return None, False, "json输入 为空字符串"
+            try:
+                return json.loads(t), True, ""
+            except Exception as e:
+                return None, False, f"json 解析失败: {str(e)}"
+        return v, True, ""
+
+    def get(self, 路径, json输入=None, 默认值=None):
+        obj, ok, msg = self._to_obj(json输入)
+        if not ok:
+            return (False, 默认值, "",)
+
+        tokens = self._parse_path(路径)
+        if not tokens:
+            try:
+                return (True, obj, json.dumps(obj, ensure_ascii=False, default=str))
+            except Exception:
+                return (True, obj, str(obj))
+
+        cur = obj
+        for t, v in tokens:
+            if t == "key":
+                if isinstance(cur, dict) and v in cur:
+                    cur = cur.get(v)
+                else:
+                    return (False, 默认值, "",)
+            elif t == "index":
+                if isinstance(cur, list) and 0 <= v < len(cur):
+                    cur = cur[v]
+                else:
+                    return (False, 默认值, "",)
+
+        try:
+            text = json.dumps(cur, ensure_ascii=False, default=str)
+        except Exception:
+            text = str(cur)
+        return (True, cur, text)

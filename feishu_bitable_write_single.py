@@ -4,6 +4,10 @@ import base64
 import io as pyio
 import uuid
 import re
+import time
+import threading
+import traceback
+from datetime import datetime
 import requests
 from comfy_api.latest import io
 import folder_paths
@@ -449,7 +453,7 @@ class FeishuBitableClient:
         print(f"[FeishuBitable] Update record status={res.status_code} body={res.text[:200]}")
         return res.status_code, res.text
 
-    def list_records(self, app_token, table_id, view_id=None, page_size=20, page_token=None, filter=None):
+    def list_records(self, app_token, table_id, view_id=None, page_size=20, page_token=None, filter=None, sort=None, automatic_fields=None):
         if self._mock:
             print(f"[FeishuBitable][MOCK] List records: table_id={table_id} filter={filter}")
             return {"items": [{"record_id": "rec_mock_1"}, {"record_id": "rec_mock_2"}], "total": 2, "has_more": False}
@@ -462,6 +466,10 @@ class FeishuBitableClient:
             params["page_token"] = page_token
         if filter:
             params["filter"] = filter
+        if sort:
+            params["sort"] = sort
+        if automatic_fields is not None:
+            params["automatic_fields"] = "true" if bool(automatic_fields) else "false"
         
         try:
             res = requests.get(url, headers=headers, params=params, timeout=20)
@@ -475,6 +483,19 @@ class FeishuBitableClient:
                         "has_more": data.get("has_more", False),
                         "page_token": data.get("page_token", "")
                     }
+                if automatic_fields is not None:
+                    params.pop("automatic_fields", None)
+                    res2 = requests.get(url, headers=headers, params=params, timeout=20)
+                    if res2.status_code == 200:
+                        j2 = res2.json()
+                        if j2.get("code") == 0:
+                            data2 = j2.get("data", {})
+                            return {
+                                "items": data2.get("items", []),
+                                "total": data2.get("total", 0),
+                                "has_more": data2.get("has_more", False),
+                                "page_token": data2.get("page_token", "")
+                            }
             print(f"[FeishuBitable] List records failed: {res.status_code} {res.text[:200]}")
         except Exception as e:
             print(f"[FeishuBitable] List records error: {e}")
@@ -493,6 +514,24 @@ class FeishuBitableClient:
         print(f"[FeishuBitable] Batch create: table_id={table_id} view_id={'set' if view_id else 'None'} count={len(records)}")
         res = requests.post(url, json=body, headers=headers, timeout=30)
         print(f"[FeishuBitable] Batch create status={res.status_code} body={res.text[:200]}")
+        return res.status_code, res.text
+
+    def batch_update_records(self, app_token, table_id, records):
+        if self._mock:
+            print(f"[FeishuBitable][MOCK] Batch update: table_id={table_id} count={len(records)}")
+            out_records = []
+            for r in records:
+                rid = ""
+                if isinstance(r, dict):
+                    rid = str(r.get("record_id") or "")
+                out_records.append({"record_id": rid or "rec_mock"})
+            return 200, json.dumps({"code": 0, "data": {"records": out_records}})
+        headers = self.headers()
+        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_update"
+        body = {"records": records}
+        print(f"[FeishuBitable] Batch update: table_id={table_id} count={len(records)}")
+        res = requests.post(url, json=body, headers=headers, timeout=30)
+        print(f"[FeishuBitable] Batch update status={res.status_code} body={res.text[:200]}")
         return res.status_code, res.text
     
     def upload_attachment(self, app_token, image_bytes, filename=None):
@@ -608,7 +647,7 @@ class FeishuBitableClient:
 
 
 class FeishuBitableConfigNode:
-    CATEGORY = "maoyu/message"
+    CATEGORY = "maoyu/多维表格"
     TITLE = "飞书表格配置 (Feishu Bitable Config)"
     class Comfy(io.ComfyNode):
         @classmethod
@@ -616,7 +655,7 @@ class FeishuBitableConfigNode:
             return io.Schema(
                 node_id="FeishuBitableConfigNode",
                 display_name="Feishu Bitable 配置",
-                category="maoyu/message",
+                category="maoyu/多维表格",
                 inputs=[
                     io.Custom("MESSAGE_CONFIG").Input("pre_config", optional=True),
                     io.String.Input("app_token", default="", tooltip="飞书多维表格 App Token"),
@@ -668,7 +707,7 @@ class FeishuBitableConfigNode:
             return io.NodeOutput(config)
 
 class FeishuBitableUpdateRowNode:
-    CATEGORY = "maoyu/message"
+    CATEGORY = "maoyu/多维表格"
     TITLE = "更新指定行 (Update Row)"
     class Comfy(io.ComfyNode):
         @classmethod
@@ -676,7 +715,7 @@ class FeishuBitableUpdateRowNode:
             return io.Schema(
                 node_id="FeishuBitableUpdateRowNode",
                 display_name="Feishu Bitable 更新行",
-                category="maoyu/message",
+                category="maoyu/多维表格",
                 inputs=[
                     io.Custom("MESSAGE_CONFIG").Input("pre_config", optional=True),
                     io.Int.Input("record_index", default=0, tooltip="行号 (1开始，0无效)"),
@@ -691,11 +730,15 @@ class FeishuBitableUpdateRowNode:
             else:
                 config["bitable_items"] = list(config["bitable_items"])
             
-            # 查找或创建一个未完成的配置项
+            # 查找或创建一个配置项
             target_index = -1
             if config["bitable_items"]:
-                # 如果最后一个项没有 app_token（即尚未与 ConfigNode 绑定），则复用它
-                if not config["bitable_items"][-1].get("app_token"):
+                for idx in range(len(config["bitable_items"]) - 1, -1, -1):
+                    it = config["bitable_items"][idx]
+                    if isinstance(it, dict) and (not (it.get("app_token") or "").strip()):
+                        target_index = idx
+                        break
+                if target_index == -1:
                     target_index = len(config["bitable_items"]) - 1
             
             if target_index == -1:
@@ -710,7 +753,7 @@ class FeishuBitableUpdateRowNode:
             return io.NodeOutput(config)
 
 class FeishuBitableUpdateIDNode:
-    CATEGORY = "maoyu/message"
+    CATEGORY = "maoyu/多维表格"
     TITLE = "更新记录ID (Update ID)"
     class Comfy(io.ComfyNode):
         @classmethod
@@ -718,7 +761,7 @@ class FeishuBitableUpdateIDNode:
             return io.Schema(
                 node_id="FeishuBitableUpdateIDNode",
                 display_name="Feishu Bitable 更新ID",
-                category="maoyu/message",
+                category="maoyu/多维表格",
                 inputs=[
                     io.Custom("MESSAGE_CONFIG").Input("pre_config", optional=True),
                     io.String.Input("record_id", default="", tooltip="记录 ID (record_id)"),
@@ -733,10 +776,15 @@ class FeishuBitableUpdateIDNode:
             else:
                 config["bitable_items"] = list(config["bitable_items"])
             
-            # 查找或创建一个未完成的配置项
+            # 查找或创建一个配置项
             target_index = -1
             if config["bitable_items"]:
-                if not config["bitable_items"][-1].get("app_token"):
+                for idx in range(len(config["bitable_items"]) - 1, -1, -1):
+                    it = config["bitable_items"][idx]
+                    if isinstance(it, dict) and (not (it.get("app_token") or "").strip()):
+                        target_index = idx
+                        break
+                if target_index == -1:
                     target_index = len(config["bitable_items"]) - 1
             
             if target_index == -1:
@@ -751,7 +799,7 @@ class FeishuBitableUpdateIDNode:
             return io.NodeOutput(config)
 
 class FeishuBitableMatchNode:
-    CATEGORY = "maoyu/message"
+    CATEGORY = "maoyu/多维表格"
     TITLE = "匹配字段更新 (Match Field)"
     class Comfy(io.ComfyNode):
         @classmethod
@@ -759,7 +807,7 @@ class FeishuBitableMatchNode:
             return io.Schema(
                 node_id="FeishuBitableMatchNode",
                 display_name="Feishu Bitable 匹配更新",
-                category="maoyu/message",
+                category="maoyu/多维表格",
                 inputs=[
                     io.Custom("MESSAGE_CONFIG").Input("pre_config", optional=True),
                     io.String.Input("match_field", default="标题", tooltip="匹配字段名"),
@@ -775,10 +823,15 @@ class FeishuBitableMatchNode:
             else:
                 config["bitable_items"] = list(config["bitable_items"])
             
-            # 查找或创建一个未完成的配置项
+            # 查找或创建一个配置项
             target_index = -1
             if config["bitable_items"]:
-                if not config["bitable_items"][-1].get("app_token"):
+                for idx in range(len(config["bitable_items"]) - 1, -1, -1):
+                    it = config["bitable_items"][idx]
+                    if isinstance(it, dict) and (not (it.get("app_token") or "").strip()):
+                        target_index = idx
+                        break
+                if target_index == -1:
                     target_index = len(config["bitable_items"]) - 1
             
             if target_index == -1:
@@ -794,7 +847,7 @@ class FeishuBitableMatchNode:
             return io.NodeOutput(config)
 
 class FeishuBitableFieldNode:
-    CATEGORY = "maoyu/message"
+    CATEGORY = "maoyu/多维表格"
     TITLE = "表格字段 (Bitable Field)"
     class Comfy(io.ComfyNode):
         @classmethod
@@ -802,7 +855,7 @@ class FeishuBitableFieldNode:
             return io.Schema(
                 node_id="FeishuBitableFieldNode",
                 display_name="Feishu Bitable 字段",
-                category="maoyu/message",
+                category="maoyu/多维表格",
                 inputs=[
                     io.Custom("MESSAGE_CONFIG").Input("pre_config", optional=True),
                     io.String.Input("field_name", default="标题", tooltip="多维表格列名"),
@@ -821,11 +874,15 @@ class FeishuBitableFieldNode:
             else:
                 config["bitable_items"] = list(config["bitable_items"])
             
-            # 查找或创建一个未完成的配置项
+            # 查找或创建一个配置项
             target_index = -1
             if config["bitable_items"]:
-                # 如果最后一个项没有 app_token（即尚未与 ConfigNode 绑定），则复用它
-                if not config["bitable_items"][-1].get("app_token"):
+                for idx in range(len(config["bitable_items"]) - 1, -1, -1):
+                    it = config["bitable_items"][idx]
+                    if isinstance(it, dict) and (not (it.get("app_token") or "").strip()):
+                        target_index = idx
+                        break
+                if target_index == -1:
                     target_index = len(config["bitable_items"]) - 1
             
             if target_index == -1:
@@ -859,7 +916,7 @@ class FeishuBitableFieldNode:
             return io.NodeOutput(config)
 
 class FeishuBitablePushNode:
-    CATEGORY = "maoyu/message"
+    CATEGORY = "maoyu/多维表格"
     OUTPUT_NODE = True
     TITLE = "飞书多维表格 (Feishu Bitable)"
     class Comfy(io.ComfyNode):
@@ -868,9 +925,12 @@ class FeishuBitablePushNode:
             return io.Schema(
                 node_id="FeishuBitablePushNode",
                 display_name="Feishu Bitable (飞书多维表格)",
-                category="maoyu/message",
+                category="maoyu/多维表格",
                 is_output_node=True,
-                outputs=[io.String.Output(display_name="写入日志")],
+                outputs=[
+                    io.String.Output(display_name="多维表格记录ID(record_id)"),
+                    io.String.Output(display_name="写入日志"),
+                ],
                 inputs=[
                     io.Custom("MESSAGE_CONFIG").Input("config"),
                 ],
@@ -885,7 +945,7 @@ class FeishuBitablePushNode:
                 return io.NodeOutput(*out)
             except Exception as e:
                 print(f"[FeishuBitable] Execute error: {e}")
-                return io.NodeOutput(f"Error: {str(e)}")
+                return io.NodeOutput("", f"Error: {str(e)}")
 
     def _has_value(self, v):
         if v is None:
@@ -1072,6 +1132,9 @@ class FeishuBitablePushNode:
                 self.filename = filename
 
         logs = []
+        record_ids = []
+        collect_only = bool(config.get("_bitable_collect_only"))
+        collected_ops = []
         
         # 1. 预处理：兼容旧版 bitable_fields 配置
         items = config.get("bitable_items", [])
@@ -1088,6 +1151,48 @@ class FeishuBitablePushNode:
                          new_item["field_types"][f["name"]] = f.get("type", "text")
                  items.append(new_item)
                  logs.append("Converted legacy fields to item")
+
+        try:
+            if isinstance(items, list) and len(items) > 1:
+                base_targets = []
+                for it in items:
+                    if isinstance(it, dict) and (it.get("app_token") or "").strip() and (it.get("table_id") or "").strip():
+                        base_targets.append(((it.get("app_token") or "").strip(), (it.get("table_id") or "").strip(), (it.get("view_id") or "").strip()), it)
+                base_key = None
+                if base_targets:
+                    uniq = []
+                    for k, _ in base_targets:
+                        if k not in uniq:
+                            uniq.append(k)
+                    if len(uniq) == 1:
+                        base_key = uniq[0]
+
+                if base_key is not None:
+                    app_token_base, table_id_base, view_id_base = base_key
+                    normalized = []
+                    for it in items:
+                        if not isinstance(it, dict):
+                            continue
+                        has_fields = isinstance(it.get("fields"), dict) and len(it.get("fields") or {}) > 0
+                        has_action = bool((it.get("record_action") or "").strip()) or bool(it.get("record_index")) or bool((it.get("record_id") or "").strip()) or bool((it.get("match_field") or "").strip())
+                        has_target = bool((it.get("app_token") or "").strip()) and bool((it.get("table_id") or "").strip())
+
+                        if (not has_target) and (has_fields or has_action):
+                            it = it.copy()
+                            it["app_token"] = app_token_base
+                            it["table_id"] = table_id_base
+                            if (it.get("view_id") or "").strip() == "" and view_id_base:
+                                it["view_id"] = view_id_base
+                            normalized.append(it)
+                            continue
+
+                        if has_target and (not has_fields) and (not has_action) and len(items) > 1:
+                            continue
+
+                        normalized.append(it)
+                    items = normalized
+        except Exception:
+            pass
 
         print(f"[FeishuBitable] Push started. Items count: {len(items)}")
         
@@ -1293,6 +1398,7 @@ class FeishuBitablePushNode:
                     
                     urls = []
                     attachments = []
+                    attachment_tokens = []
                     
                     for v in val_list:
                         if isinstance(v, str):
@@ -1327,6 +1433,19 @@ class FeishuBitablePushNode:
                         
                         elif isinstance(v, dict):
                             try:
+                                ftok = (v.get("file_token") or v.get("fileToken") or v.get("token") or "").strip()
+                                if ftok:
+                                    attachment_tokens.append({"file_token": ftok})
+                                    continue
+                                data_obj = v.get("data")
+                                if isinstance(data_obj, dict):
+                                    ftok2 = (data_obj.get("file_token") or data_obj.get("fileToken") or data_obj.get("token") or "").strip()
+                                    if ftok2:
+                                        attachment_tokens.append({"file_token": ftok2})
+                                        continue
+                            except Exception:
+                                pass
+                            try:
                                 v_paths = []
                                 if "filename" in v or "video_path" in v:
                                     v_paths.append(v.get("video_path") or v.get("filename"))
@@ -1334,9 +1453,16 @@ class FeishuBitablePushNode:
                                     v_paths.extend(v["filenames"])
                                 elif "waveform" in v and "sample_rate" in v:
                                     pass
+                                elif "name" in v and ("subfolder" in v or "type" in v):
+                                    v_paths.append(v.get("name"))
+                                elif isinstance(v.get("data"), dict) and ("name" in v.get("data")):
+                                    v_paths.append(v.get("data", {}).get("name"))
                                 
                                 v_sub = v.get("subfolder", "")
                                 v_type = v.get("type", "input")
+                                if isinstance(v.get("data"), dict):
+                                    v_sub = v_sub or v.get("data", {}).get("subfolder", "")
+                                    v_type = v_type or v.get("data", {}).get("type", "input")
                                 
                                 for v_path in v_paths:
                                     if isinstance(v_path, list):
@@ -1547,7 +1673,12 @@ class FeishuBitablePushNode:
                                 pass
 
                     if ftype == "attachment":
-                        fields[name] = attachments
+                        if attachment_tokens and attachments:
+                            fields[name] = {"__bitable_attachment_tokens": attachment_tokens, "__bitable_attachment_uploads": attachments}
+                        elif attachment_tokens:
+                            fields[name] = attachment_tokens
+                        else:
+                            fields[name] = attachments
                     else:
                         if ftype == "url":
                             if has_gitee and urls:
@@ -1640,7 +1771,60 @@ class FeishuBitablePushNode:
             if name_to_id:
                 for k, v in fields.items():
                     if k in name_to_id:
-                        if isinstance(v, list) and v and (isinstance(v[0], (bytes, bytearray)) or isinstance(v[0], MediaItem)) and field_types.get(k) == "attachment":
+                        if isinstance(v, dict) and field_types.get(k) == "attachment" and ("__bitable_attachment_tokens" in v or "__bitable_attachment_uploads" in v):
+                            base_tokens = v.get("__bitable_attachment_tokens") if isinstance(v.get("__bitable_attachment_tokens"), list) else []
+                            uploads = v.get("__bitable_attachment_uploads") if isinstance(v.get("__bitable_attachment_uploads"), list) else []
+                            tokens = []
+                            for t in base_tokens:
+                                if isinstance(t, dict) and ("file_token" in t or "fileToken" in t):
+                                    ft = t.get("file_token") or t.get("fileToken")
+                                    if ft:
+                                        tokens.append({"file_token": ft})
+                            for idx, ib in enumerate(uploads):
+                                try:
+                                    if isinstance(ib, MediaItem):
+                                        ftok = client.upload_file(resolved_app_token, ib.data, ib.filename)
+                                    else:
+                                        ftok = client.upload_attachment(resolved_app_token, ib, f"image_{uuid.uuid4().hex}.png")
+                                    if ftok:
+                                        tokens.append({"file_token": ftok})
+                                        logs.append(f"Attachment Uploaded: {ftok}")
+                                except Exception as e:
+                                    logs.append(f"Attachment Upload Error: {str(e)}")
+                            target_name = k
+                            try:
+                                finfo = fields_info.get(k, {})
+                                if str(finfo.get("ui_type", "")).lower() != "attachment" and finfo.get("type") != 17:
+                                    target_name = f"{k}附件"
+                                    if target_name not in name_to_id:
+                                        sc, st = client.create_field(resolved_app_token, table_id, target_name, "attachment")
+                                        logs.append(f"Auto Create Attachment Field[{target_name}]: {sc}")
+                                        if sc in (200, 201):
+                                            try:
+                                                import time
+                                                time.sleep(0.5)
+                                                rj = json.loads(st)
+                                                fid = rj.get("data", {}).get("field", {}).get("field_id")
+                                                if fid:
+                                                    target_name = fid
+                                            except Exception:
+                                                pass
+                                            name_to_id = client.list_fields_map(resolved_app_token, table_id)
+                                            fields_info = client.list_fields_info(resolved_app_token, table_id)
+                            except Exception:
+                                pass
+                            if tokens:
+                                fields_payload[target_name] = tokens
+                        elif isinstance(v, list) and v and (isinstance(v[0], dict) and ("file_token" in v[0] or "fileToken" in v[0])) and field_types.get(k) == "attachment":
+                            tokens = []
+                            for t in v:
+                                if isinstance(t, dict):
+                                    ft = t.get("file_token") or t.get("fileToken")
+                                    if ft:
+                                        tokens.append({"file_token": ft})
+                            if tokens:
+                                fields_payload[k] = tokens
+                        elif isinstance(v, list) and v and (isinstance(v[0], (bytes, bytearray)) or isinstance(v[0], MediaItem)) and field_types.get(k) == "attachment":
                             tokens = []
                             for idx, ib in enumerate(v):
                                 try:
@@ -1763,6 +1947,19 @@ class FeishuBitablePushNode:
                 else:
                     logs.append(f"Match not found, append new")
 
+            if collect_only:
+                op = "update" if bool(should_update) else "create"
+                collected_ops.append({
+                    "op": op,
+                    "app_token": resolved_app_token,
+                    "table_id": table_id,
+                    "view_id": v_id if (v_id or "").strip() else "",
+                    "record_id": str(target_record_id or "").strip(),
+                    "fields": fields_payload,
+                    "fields_rich": _to_rich_payload(fields_payload),
+                })
+                return
+
             try:
                 print(f"[FeishuBitable] Sending {'update' if should_update else 'create'}_record. Fields keys: {list(fields_payload.keys())}")
                 if should_update:
@@ -1801,6 +1998,25 @@ class FeishuBitablePushNode:
             
             if success:
                 logs.append(f"Feishu Bitable[{table_id}]: OK")
+                rid = ""
+                if should_update:
+                    rid = str(target_record_id or "").strip()
+                else:
+                    try:
+                        j = json.loads(text)
+                        data = j.get("data") or {}
+                        if isinstance(data, dict):
+                            rid = str(data.get("record_id") or "").strip()
+                            if not rid and isinstance(data.get("record"), dict):
+                                rid = str((data.get("record") or {}).get("record_id") or "").strip()
+                            if not rid and isinstance(data.get("records"), list) and data.get("records"):
+                                first = data.get("records")[0]
+                                if isinstance(first, dict):
+                                    rid = str(first.get("record_id") or "").strip()
+                    except Exception:
+                        rid = ""
+                if rid:
+                    record_ids.append(rid)
             else:
                 logs.append(f"Feishu Bitable[{table_id}]: Fail({http_status}) {text}")
 
@@ -1833,7 +2049,1378 @@ class FeishuBitablePushNode:
                 # Should not happen as we convert legacy fields to items at the top
                 pass
 
-        return (" | ".join(logs),)
+        rid_out = ""
+        if record_ids:
+            if len(record_ids) == 1:
+                rid_out = record_ids[0]
+            else:
+                rid_out = ",".join([str(x) for x in record_ids if str(x).strip()])
+        if collect_only:
+            return (collected_ops, " | ".join(logs))
+        return (rid_out, " | ".join(logs))
+
+_BITABLE_ERROR_MONITOR_LOCK = threading.RLock()
+_BITABLE_ERROR_MONITOR_ENABLED = False
+_BITABLE_ERROR_MONITOR_STARTED = False
+_BITABLE_ERROR_MONITOR_SENDING = False
+_BITABLE_ERROR_MONITOR_LAST_SENT_TS = 0.0
+_BITABLE_ERROR_MONITOR_COOLDOWN_SECONDS = 3
+_BITABLE_ERROR_MONITOR_CONFIG = None
+_BITABLE_ERROR_MONITOR_MAX_CHARS = 6000
+_BITABLE_ERROR_MONITOR_PUSH_DETAILS = True
+_BITABLE_ERROR_MONITOR_RECENT = []
+_BITABLE_ERROR_MONITOR_QUEUE = []
+_BITABLE_ERROR_MONITOR_EVENT = threading.Event()
+_BITABLE_ERROR_MONITOR_EXEC_PATCHED = False
+_BITABLE_ERROR_MONITOR_EXEC_ORIG = None
+_BITABLE_ERROR_MONITOR_EXECUTE_PATCHED = False
+_BITABLE_ERROR_MONITOR_EXECUTE_ORIG = None
+_BITABLE_ERROR_MONITOR_AUTOCONFIGURED = False
+_BITABLE_ERROR_MONITOR_BOOTSTRAPPED = False
+_BITABLE_ERROR_MONITOR_HOOKED_EXCEPTHOOK = False
+_BITABLE_ERROR_MONITOR_PROMPT_HANDLER_INSTALLED = False
+_BITABLE_ERROR_MONITOR_LAST_PROMPT = None
+_BITABLE_ERROR_MONITOR_LAST_CONFIG_SRC_ID = None
+_BITABLE_ERROR_MONITOR_LAST_MONITOR_NODE_ID = None
+_BITABLE_ERROR_MONITOR_LAST_CONFIG_NODE_ID = None
+_BITABLE_ERROR_MONITOR_PROMPT_HANDLER_RETRY_STARTED = False
+_BITABLE_ERROR_MONITOR_DEBUG = str(os.getenv("FEISHU_BITABLE_DEBUG", "")).strip().lower() in ("1", "true", "yes", "on")
+_BITABLE_ERROR_MONITOR_DEBUG_SEEN = set()
+
+def _bitable_error_monitor_debug(tag, msg):
+    if not _BITABLE_ERROR_MONITOR_DEBUG:
+        return
+    try:
+        print(f"[FeishuBitable][ErrorMonitor][DEBUG][{tag}] {msg}")
+    except Exception:
+        pass
+
+def _bitable_error_monitor_set_last_prompt(prompt):
+    global _BITABLE_ERROR_MONITOR_LAST_PROMPT
+    if not isinstance(prompt, dict):
+        return
+    with _BITABLE_ERROR_MONITOR_LOCK:
+        _BITABLE_ERROR_MONITOR_LAST_PROMPT = prompt
+    _bitable_error_monitor_debug("prompt", f"saved prompt nodes={len(prompt)}")
+
+def _bitable_error_monitor_get_link_src(v):
+    if isinstance(v, list) and len(v) == 2:
+        return v[0]
+    return None
+
+def _bitable_error_monitor_pick_target(config):
+    if not isinstance(config, dict):
+        return None
+    items = config.get("bitable_items")
+    if isinstance(items, list) and items:
+        for it in reversed(items):
+            if isinstance(it, dict) and (it.get("app_token") or "").strip() and (it.get("table_id") or "").strip():
+                return it.copy()
+    app_token = (config.get("bitable_app_token") or "").strip()
+    table_id = (config.get("bitable_table_id") or "").strip()
+    view_id = (config.get("bitable_view_id") or "").strip()
+    if app_token and table_id:
+        return {"app_token": app_token, "table_id": table_id, "view_id": view_id}
+    return None
+
+def _bitable_error_monitor_render_fields(template_fields, context):
+    out = {}
+    if not isinstance(template_fields, dict):
+        return out
+    for k, v in template_fields.items():
+        key = str(k).strip()
+        if not key:
+            continue
+        if isinstance(v, str):
+            try:
+                out[key] = v.format(**context)
+            except Exception:
+                out[key] = v
+        else:
+            out[key] = v
+    return out
+
+def _bitable_error_monitor_guess_type(v):
+    if isinstance(v, bool):
+        return "checkbox"
+    if isinstance(v, (int, float)):
+        return "number"
+    if isinstance(v, list) and v:
+        if isinstance(v[0], dict) and ("file_token" in v[0] or "fileToken" in v[0]):
+            return "attachment"
+    return "text"
+
+def _bitable_error_monitor_coerce_fields(raw_fields, context):
+    if not isinstance(raw_fields, dict):
+        return {}
+    out = {}
+    for k, v in raw_fields.items():
+        kk = str(k).strip()
+        if not kk:
+            continue
+        if isinstance(v, str):
+            try:
+                out[kk] = v.format(**context)
+            except Exception:
+                out[kk] = v
+            continue
+        if isinstance(v, (int, float, bool)) or v is None:
+            out[kk] = v
+            continue
+        if isinstance(v, (list, dict)):
+            out[kk] = v
+            continue
+        try:
+            out[kk] = str(v)
+        except Exception:
+            out[kk] = ""
+    return out
+
+def _bitable_error_monitor_extract_summary(text):
+    t = str(text or "")
+    lines = [x.strip() for x in t.splitlines() if x.strip()]
+    if not lines:
+        return ""
+    for i in range(len(lines) - 1, -1, -1):
+        line = lines[i]
+        if line and set(line) <= {"^"}:
+            continue
+        if "Error" in line or "Exception" in line or "Traceback" in line:
+            return line
+    for i in range(len(lines) - 1, -1, -1):
+        line = lines[i]
+        if line and set(line) <= {"^"}:
+            continue
+        if "!!! Exception during processing !!!" in line:
+            continue
+        if "RuntimeError" in line:
+            return line
+    return lines[-1]
+
+def _bitable_error_monitor_sanitize_traceback(text):
+    s = str(text or "")
+    if not s.strip():
+        return ""
+    out_lines = []
+    for line in s.splitlines():
+        t = line.rstrip("\r\n")
+        if t.strip() and set(t.strip()) <= {"^"}:
+            continue
+        out_lines.append(t)
+    cleaned = "\n".join(out_lines).strip()
+    return cleaned
+
+def _bitable_error_monitor_extract_custom_fields_from_prompt(prompt):
+    if not isinstance(prompt, dict):
+        return {}, {}
+    fields = {}
+    field_types = {}
+    for _, nobj in prompt.items():
+        if not isinstance(nobj, dict):
+            continue
+        ct = nobj.get("class_type")
+        if ct not in ("FeishuBitableFieldNode", "FeishuBitableFieldNode.Comfy"):
+            continue
+        fn = str(_bitable_error_monitor_prompt_get_input(nobj, "field_name") or "").strip()
+        ft = str(_bitable_error_monitor_prompt_get_input(nobj, "field_type") or "").strip()
+        fv_raw = None
+        if isinstance(nobj.get("inputs"), dict):
+            fv_raw = nobj.get("inputs", {}).get("field_value")
+        fv = _bitable_error_monitor_resolve_value_from_prompt(prompt, fv_raw)
+        if fn and (fv is not None):
+            fields[fn] = fv
+            if ft:
+                field_types[fn] = ft
+    return fields, field_types
+
+def _bitable_error_monitor_collect_pre_config_chain(prompt, start_node_id, max_hops=200):
+    if not isinstance(prompt, dict):
+        return []
+
+    def _get_node(nid):
+        return prompt.get(nid) or prompt.get(str(nid))
+
+    def _node_score(node_obj):
+        if not isinstance(node_obj, dict):
+            return 0
+        ct = node_obj.get("class_type")
+        if ct in ("FeishuBitableFieldNode", "FeishuBitableFieldNode.Comfy"):
+            return 10
+        if ct in ("FeishuBitableUpdateRowNode", "FeishuBitableUpdateRowNode.Comfy", "FeishuBitableUpdateIDNode", "FeishuBitableUpdateIDNode.Comfy", "FeishuBitableMatchNode", "FeishuBitableMatchNode.Comfy"):
+            return 5
+        if ct in ("FeishuBitableConfigNode", "FeishuBitableConfigNode.Comfy"):
+            return 3
+        return 0
+
+    def _get_predecessors(node_obj):
+        if not isinstance(node_obj, dict):
+            return []
+        inputs = node_obj.get("inputs")
+        if not isinstance(inputs, dict):
+            return []
+
+        preds = []
+
+        nxt = _bitable_error_monitor_get_link_src(inputs.get("pre_config"))
+        if nxt is not None:
+            return [nxt]
+
+        ct = node_obj.get("class_type")
+        if ct in ("AnySwitch", "AnySwitch.Comfy"):
+            a = _bitable_error_monitor_get_link_src(inputs.get("优先输入"))
+            b = _bitable_error_monitor_get_link_src(inputs.get("备用输入"))
+            if a is not None:
+                preds.append(a)
+            if b is not None:
+                preds.append(b)
+            return preds
+
+        if ct in ("AnyBooleanSwitch", "AnyBooleanSwitch.Comfy"):
+            a = _bitable_error_monitor_get_link_src(inputs.get("输入"))
+            if a is not None:
+                preds.append(a)
+            return preds
+
+        if ct in ("ComfySwitchNode", "ComfySoftSwitchNode"):
+            on_true = _bitable_error_monitor_get_link_src(inputs.get("on_true"))
+            on_false = _bitable_error_monitor_get_link_src(inputs.get("on_false"))
+            sw_raw = inputs.get("switch")
+            sw = sw_raw if isinstance(sw_raw, bool) else _bitable_error_monitor_resolve_value_from_prompt(prompt, sw_raw)
+            if isinstance(sw, bool):
+                chosen = on_true if sw else on_false
+                other = on_false if sw else on_true
+                if chosen is not None:
+                    preds.append(chosen)
+                if other is not None:
+                    preds.append(other)
+                return preds
+            if on_true is not None:
+                preds.append(on_true)
+            if on_false is not None:
+                preds.append(on_false)
+            return preds
+
+        link_sources = []
+        for vv in inputs.values():
+            sid = _bitable_error_monitor_get_link_src(vv)
+            if sid is not None:
+                link_sources.append(sid)
+        if len(link_sources) == 1:
+            return [link_sources[0]]
+        return []
+
+    memo = {}
+
+    def _best_chain(nid, visiting):
+        if nid is None:
+            return []
+        if nid in memo:
+            return memo[nid]
+        if nid in visiting:
+            return []
+        visiting.add(nid)
+
+        node_obj = _get_node(nid)
+        preds = _get_predecessors(node_obj)
+        best = [nid]
+        best_score = _node_score(node_obj)
+
+        for p in preds:
+            ch = _best_chain(p, visiting)
+            if not ch:
+                cand = [nid]
+            else:
+                cand = ch + [nid]
+            if len(cand) > int(max_hops or 200):
+                cand = cand[-int(max_hops or 200):]
+            s = 0
+            for x in cand:
+                s += _node_score(_get_node(x))
+            if (s > best_score) or (s == best_score and len(cand) < len(best)):
+                best = cand
+                best_score = s
+
+        visiting.remove(nid)
+        memo[nid] = best
+        return best
+
+    return _best_chain(start_node_id, set())
+
+def _bitable_error_monitor_extract_chain_item(prompt, config_src_id):
+    if not isinstance(prompt, dict):
+        return {}
+    chain_ids = _bitable_error_monitor_collect_pre_config_chain(prompt, config_src_id)
+    if not chain_ids:
+        return {}
+    ordered = list(chain_ids)
+
+    fields = {}
+    field_types = {}
+    record_action = "append"
+    record_index = 0
+    record_id = ""
+    match_field = ""
+    match_value = None
+
+    for nid in ordered:
+        nobj = prompt.get(nid) or prompt.get(str(nid))
+        if not isinstance(nobj, dict):
+            continue
+        ct = nobj.get("class_type")
+        if ct in ("FeishuBitableFieldNode", "FeishuBitableFieldNode.Comfy"):
+            fn = str(_bitable_error_monitor_prompt_get_input(nobj, "field_name") or "").strip()
+            ft = str(_bitable_error_monitor_prompt_get_input(nobj, "field_type") or "").strip()
+            fv_raw = None
+            if isinstance(nobj.get("inputs"), dict):
+                fv_raw = nobj.get("inputs", {}).get("field_value")
+            fv = _bitable_error_monitor_resolve_value_from_prompt(prompt, fv_raw)
+            if _BITABLE_ERROR_MONITOR_DEBUG:
+                try:
+                    _bitable_error_monitor_debug("fieldnode", f"id={nid} name={fn} raw={fv_raw} resolved={fv}")
+                    if (fv is None) and isinstance(fv_raw, list) and len(fv_raw) == 2:
+                        sid = fv_raw[0]
+                        sobj = prompt.get(sid) or prompt.get(str(sid))
+                        if isinstance(sobj, dict):
+                            ins = sobj.get("inputs")
+                            _bitable_error_monitor_debug("fieldnode", f"src_id={sid} src_type={sobj.get('class_type')} src_input_keys={list(ins.keys()) if isinstance(ins, dict) else None}")
+                        else:
+                            _bitable_error_monitor_debug("fieldnode", f"src_id={sid} src_node_missing")
+                except Exception:
+                    pass
+            if fn and (fv is not None):
+                fields[fn] = fv
+                if ft:
+                    field_types[fn] = ft
+        elif ct in ("FeishuBitableUpdateRowNode", "FeishuBitableUpdateRowNode.Comfy"):
+            ri = _bitable_error_monitor_prompt_get_input(nobj, "record_index")
+            try:
+                record_index = int(ri or 0)
+            except Exception:
+                record_index = 0
+            if record_index > 0:
+                record_action = "update_index"
+        elif ct in ("FeishuBitableUpdateIDNode", "FeishuBitableUpdateIDNode.Comfy"):
+            rid = str(_bitable_error_monitor_prompt_get_input(nobj, "record_id") or "").strip()
+            if rid:
+                record_id = rid
+                record_action = "update_id"
+        elif ct in ("FeishuBitableMatchNode", "FeishuBitableMatchNode.Comfy"):
+            mf = str(_bitable_error_monitor_prompt_get_input(nobj, "match_field") or "").strip()
+            mv_raw = None
+            if isinstance(nobj.get("inputs"), dict):
+                mv_raw = nobj.get("inputs", {}).get("match_value")
+            mv = _bitable_error_monitor_resolve_value_from_prompt(prompt, mv_raw)
+            if mf and (mv is not None) and (str(mv).strip() != ""):
+                match_field = mf
+                match_value = mv
+                record_action = "update_match"
+
+    return {
+        "fields": fields,
+        "field_types": field_types,
+        "record_action": record_action,
+        "record_index": record_index,
+        "record_id": record_id,
+        "match_field": match_field,
+        "match_value": match_value,
+    }
+
+def _bitable_error_monitor_find_monitor_from_prompt(prompt):
+    if not isinstance(prompt, dict):
+        return None
+    chosen = None
+    for nid, nobj in prompt.items():
+        if not isinstance(nobj, dict):
+            continue
+        ct = nobj.get("class_type")
+        if ct not in ("FeishuBitableErrorMonitorNode", "FeishuBitableErrorMonitorNode.Comfy"):
+            continue
+        ev = _bitable_error_monitor_prompt_get_input_any(prompt, nobj, "enabled")
+        if chosen is None:
+            chosen = (nid, nobj)
+        if isinstance(ev, bool) and ev is True:
+            return (nid, nobj)
+    return chosen
+
+def _bitable_error_monitor_should_trigger(chunk_text):
+    s = str(chunk_text or "")
+    if "Traceback (most recent call last)" in s:
+        return True
+    if "Traceback" in s and "most recent call last" in s:
+        return True
+    if "ERROR" in s:
+        return True
+    if "Exception:" in s:
+        return True
+    if "Error:" in s:
+        return True
+    if "RuntimeError" in s:
+        return True
+    return False
+
+def _bitable_error_monitor_enqueue(ts, text, force=False):
+    global _BITABLE_ERROR_MONITOR_RECENT, _BITABLE_ERROR_MONITOR_QUEUE
+    with _BITABLE_ERROR_MONITOR_LOCK:
+        if not _BITABLE_ERROR_MONITOR_ENABLED or _BITABLE_ERROR_MONITOR_SENDING:
+            return
+        t = str(text or "")
+        if (not force) and (not _bitable_error_monitor_should_trigger(t)):
+            return
+        now_str = ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if force:
+            trimmed = t[-(_BITABLE_ERROR_MONITOR_MAX_CHARS):] if t else ""
+            _BITABLE_ERROR_MONITOR_QUEUE.append({"time": now_str, "text": trimmed, "forced": True})
+            if len(_BITABLE_ERROR_MONITOR_QUEUE) > 20:
+                _BITABLE_ERROR_MONITOR_QUEUE = _BITABLE_ERROR_MONITOR_QUEUE[-20:]
+            _BITABLE_ERROR_MONITOR_EVENT.set()
+            return
+
+        if t:
+            _BITABLE_ERROR_MONITOR_RECENT.append(t if t.endswith("\n") else (t + "\n"))
+            if len(_BITABLE_ERROR_MONITOR_RECENT) > 400:
+                _BITABLE_ERROR_MONITOR_RECENT = _BITABLE_ERROR_MONITOR_RECENT[-400:]
+        combined = "".join(_BITABLE_ERROR_MONITOR_RECENT)[-(_BITABLE_ERROR_MONITOR_MAX_CHARS):]
+        _BITABLE_ERROR_MONITOR_QUEUE.append({"time": now_str, "text": combined, "forced": False})
+        if len(_BITABLE_ERROR_MONITOR_QUEUE) > 20:
+            _BITABLE_ERROR_MONITOR_QUEUE = _BITABLE_ERROR_MONITOR_QUEUE[-20:]
+        _BITABLE_ERROR_MONITOR_EVENT.set()
+
+def _bitable_error_monitor_enqueue_execution_error(ts, exception_type, exception_message, traceback_text):
+    global _BITABLE_ERROR_MONITOR_QUEUE
+    with _BITABLE_ERROR_MONITOR_LOCK:
+        if not _BITABLE_ERROR_MONITOR_ENABLED or _BITABLE_ERROR_MONITOR_SENDING:
+            return
+        _BITABLE_ERROR_MONITOR_QUEUE.append({
+            "time": ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "kind": "execution_error",
+            "exception_type": str(exception_type or ""),
+            "exception_message": str(exception_message or ""),
+            "traceback": str(traceback_text or ""),
+        })
+        if len(_BITABLE_ERROR_MONITOR_QUEUE) > 20:
+            _BITABLE_ERROR_MONITOR_QUEUE = _BITABLE_ERROR_MONITOR_QUEUE[-20:]
+        _BITABLE_ERROR_MONITOR_EVENT.set()
+
+def _bitable_error_monitor_patch_execution():
+    global _BITABLE_ERROR_MONITOR_EXEC_PATCHED, _BITABLE_ERROR_MONITOR_EXEC_ORIG, _BITABLE_ERROR_MONITOR_EXECUTE_PATCHED, _BITABLE_ERROR_MONITOR_EXECUTE_ORIG
+    if _BITABLE_ERROR_MONITOR_EXEC_PATCHED and _BITABLE_ERROR_MONITOR_EXECUTE_PATCHED:
+        return
+    try:
+        import execution as comfy_execution
+        if not hasattr(comfy_execution, "PromptExecutor"):
+            return
+        if not _BITABLE_ERROR_MONITOR_EXEC_PATCHED:
+            orig = comfy_execution.PromptExecutor.handle_execution_error
+            _BITABLE_ERROR_MONITOR_EXEC_ORIG = orig
+
+            def _wrapped_handle_execution_error(self, prompt_id, prompt, current_outputs, executed, error, ex):
+                try:
+                    try:
+                        _bitable_error_monitor_try_autoconfig_from_prompt(prompt)
+                        _bitable_error_monitor_set_last_prompt(prompt)
+                    except Exception:
+                        pass
+                    et = ""
+                    em = ""
+                    tb = ""
+                    if isinstance(error, dict):
+                        et = str(error.get("exception_type") or "")
+                        em = str(error.get("exception_message") or "")
+                        tb = error.get("traceback") or ""
+                    if isinstance(tb, list):
+                        tb = "".join(tb)
+                    if ex is not None:
+                        try:
+                            ex_type = type(ex).__name__
+                            if not et:
+                                et = ex_type
+                            if not em:
+                                em = str(ex)
+                            tb_ex = "".join(traceback.format_exception(type(ex), ex, ex.__traceback__))
+                            if tb_ex and ("Traceback" in tb_ex or "File " in tb_ex):
+                                tb_s = str(tb or "").strip()
+                                if (not tb_s) or (len(tb_s) < 30) or (set(tb_s) <= {"^"}) or (("Traceback" in tb_ex) and ("Traceback" not in tb_s)):
+                                    tb = tb_ex
+                        except Exception:
+                            pass
+                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    _bitable_error_monitor_enqueue_execution_error(ts, et, em, tb)
+                except Exception:
+                    pass
+                return orig(self, prompt_id, prompt, current_outputs, executed, error, ex)
+
+            comfy_execution.PromptExecutor.handle_execution_error = _wrapped_handle_execution_error
+            _BITABLE_ERROR_MONITOR_EXEC_PATCHED = True
+            _bitable_error_monitor_debug("patch", "patched PromptExecutor.handle_execution_error")
+
+        if not _BITABLE_ERROR_MONITOR_EXECUTE_PATCHED:
+            orig_exec = comfy_execution.PromptExecutor.execute
+            _BITABLE_ERROR_MONITOR_EXECUTE_ORIG = orig_exec
+
+            def _wrapped_execute(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
+                try:
+                    _bitable_error_monitor_try_autoconfig_from_prompt(prompt)
+                    _bitable_error_monitor_set_last_prompt(prompt)
+                    _bitable_error_monitor_debug("execute", f"PromptExecutor.execute prompt_id={prompt_id} nodes={len(prompt) if isinstance(prompt, dict) else 'NA'}")
+                except Exception:
+                    pass
+                return orig_exec(self, prompt, prompt_id, extra_data, execute_outputs)
+
+            comfy_execution.PromptExecutor.execute = _wrapped_execute
+            _BITABLE_ERROR_MONITOR_EXECUTE_PATCHED = True
+            _bitable_error_monitor_debug("patch", "patched PromptExecutor.execute")
+    except Exception:
+        try:
+            traceback.print_exc()
+        except Exception:
+            pass
+
+def _bitable_error_monitor_patch_excepthook():
+    global _BITABLE_ERROR_MONITOR_HOOKED_EXCEPTHOOK
+    if _BITABLE_ERROR_MONITOR_HOOKED_EXCEPTHOOK:
+        return
+    try:
+        import sys as _sys
+        orig_sys = getattr(_sys, "excepthook", None)
+        def _wrapped_sys_excepthook(exc_type, exc, tb):
+            try:
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                tb_text = "".join(traceback.format_exception(exc_type, exc, tb))
+                _bitable_error_monitor_enqueue_execution_error(ts, getattr(exc_type, "__name__", "") or "", str(exc or ""), tb_text)
+            except Exception:
+                pass
+            if callable(orig_sys):
+                return orig_sys(exc_type, exc, tb)
+            return None
+        _sys.excepthook = _wrapped_sys_excepthook
+    except Exception:
+        pass
+
+    try:
+        import threading as _threading
+        orig_th = getattr(_threading, "excepthook", None)
+        def _wrapped_threading_excepthook(args):
+            try:
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                et = getattr(getattr(args, "exc_type", None), "__name__", "") or ""
+                em = str(getattr(args, "exc_value", "") or "")
+                tb_obj = getattr(args, "exc_traceback", None)
+                tb_text = ""
+                try:
+                    if tb_obj is not None:
+                        tb_text = "".join(traceback.format_exception(getattr(args, "exc_type", None), getattr(args, "exc_value", None), tb_obj))
+                except Exception:
+                    tb_text = ""
+                _bitable_error_monitor_enqueue_execution_error(ts, et, em, tb_text)
+            except Exception:
+                pass
+            if callable(orig_th):
+                return orig_th(args)
+            return None
+        if hasattr(_threading, "excepthook"):
+            _threading.excepthook = _wrapped_threading_excepthook
+    except Exception:
+        pass
+    _BITABLE_ERROR_MONITOR_HOOKED_EXCEPTHOOK = True
+
+def _bitable_error_monitor_bootstrap():
+    global _BITABLE_ERROR_MONITOR_BOOTSTRAPPED, _BITABLE_ERROR_MONITOR_STARTED
+    if _BITABLE_ERROR_MONITOR_BOOTSTRAPPED:
+        return
+    try:
+        try:
+            _bitable_error_monitor_patch_execution()
+        except Exception:
+            pass
+        try:
+            _bitable_error_monitor_patch_excepthook()
+        except Exception:
+            pass
+        try:
+            _bitable_error_monitor_install_prompt_handler()
+        except Exception:
+            pass
+        try:
+            _bitable_error_monitor_start_prompt_handler_retry()
+        except Exception:
+            pass
+        try:
+            import app.logger as comfy_app_logger
+            comfy_app_logger.on_flush(_bitable_error_monitor_on_flush)
+        except Exception:
+            pass
+        if not _BITABLE_ERROR_MONITOR_STARTED:
+            t = threading.Thread(target=_bitable_error_monitor_worker, name="AnySwitch_BitableErrorMonitor", daemon=True)
+            t.start()
+            _BITABLE_ERROR_MONITOR_STARTED = True
+    finally:
+        _BITABLE_ERROR_MONITOR_BOOTSTRAPPED = True
+
+def _bitable_error_monitor_is_plain_value(v):
+    return isinstance(v, (str, int, float, bool)) or v is None
+
+def _bitable_error_monitor_prompt_get_input(node_obj, name):
+    if not isinstance(node_obj, dict):
+        return None
+    inputs = node_obj.get("inputs")
+    if not isinstance(inputs, dict):
+        return None
+    v = inputs.get(name)
+    if _bitable_error_monitor_is_plain_value(v):
+        return v
+    return None
+
+def _bitable_error_monitor_prompt_get_input_any(prompt, node_obj, name):
+    v = _bitable_error_monitor_prompt_get_input(node_obj, name)
+    if v is not None:
+        return v
+    if not isinstance(node_obj, dict):
+        return None
+    inputs = node_obj.get("inputs")
+    if not isinstance(inputs, dict):
+        return None
+    raw = inputs.get(name)
+    return _bitable_error_monitor_resolve_value_from_prompt(prompt, raw)
+
+def _bitable_error_monitor_resolve_value_from_prompt(prompt, val):
+    def _pick_from_inputs(node_obj):
+        if not isinstance(node_obj, dict):
+            return None
+        inputs = node_obj.get("inputs")
+        if not isinstance(inputs, dict):
+            return None
+
+        scalars = []
+        for k, vv in inputs.items():
+            if _bitable_error_monitor_is_plain_value(vv):
+                if isinstance(vv, str):
+                    if vv.strip() == "":
+                        continue
+                scalars.append((k, vv))
+
+        if len(scalars) == 1:
+            return scalars[0][1]
+
+        if scalars:
+            smap = {k: v for k, v in scalars}
+            try:
+                import nodes as comfy_nodes
+                ct = node_obj.get("class_type")
+                obj_class = comfy_nodes.NODE_CLASS_MAPPINGS.get(ct)
+                if obj_class is not None and hasattr(obj_class, "INPUT_TYPES"):
+                    it = obj_class.INPUT_TYPES()
+                    ordered = []
+                    if isinstance(it, dict):
+                        req = it.get("required")
+                        opt = it.get("optional")
+                        if isinstance(req, dict):
+                            ordered.extend(list(req.keys()))
+                        if isinstance(opt, dict):
+                            ordered.extend(list(opt.keys()))
+                    if ordered:
+                        rest = [k for k, _ in scalars if k not in ordered]
+                        ordered = [k for k in ordered if k in smap] + sorted(rest)
+                        parts = [f"{k}={smap.get(k)}" for k in ordered if k in smap]
+                        if parts:
+                            return " | ".join(parts)
+            except Exception:
+                pass
+
+            ordered = sorted([k for k, _ in scalars])
+            parts = [f"{k}={smap.get(k)}" for k in ordered if k in smap]
+            if parts:
+                return " | ".join(parts)
+            return None
+
+        wv = node_obj.get("widgets_values")
+        if isinstance(wv, list):
+            only_scalars = []
+            for x in wv:
+                if _bitable_error_monitor_is_plain_value(x):
+                    if isinstance(x, str) and x.strip() == "":
+                        continue
+                    only_scalars.append(x)
+            if len(only_scalars) == 1:
+                return only_scalars[0]
+            if only_scalars:
+                parts = [f"w{i}={v}" for i, v in enumerate(only_scalars)]
+                return " | ".join(parts)
+        return None
+
+    def _resolve(v, depth, seen):
+        if _bitable_error_monitor_is_plain_value(v):
+            return v
+        if depth <= 0:
+            return None
+        if not isinstance(v, list) or len(v) != 2:
+            return None
+        if not isinstance(prompt, dict):
+            return None
+        src_id = v[0]
+        if src_id in seen:
+            return None
+        seen.add(src_id)
+        src = prompt.get(src_id) or prompt.get(str(src_id))
+        if not isinstance(src, dict):
+            return None
+
+        got_simple = _pick_from_inputs(src)
+        if got_simple is not None:
+            return got_simple
+
+        inputs = src.get("inputs")
+        if isinstance(inputs, dict):
+            for key in ("text", "value", "string", "prompt", "message", "input", "content", "name", "title", "positive", "negative", "正面提示词", "反面提示词", "内容", "文本"):
+                vv = inputs.get(key)
+                if _bitable_error_monitor_is_plain_value(vv):
+                    if isinstance(vv, str):
+                        if vv.strip() != "":
+                            return vv
+                    else:
+                        return vv
+            only_scalars = []
+            for vv in inputs.values():
+                if _bitable_error_monitor_is_plain_value(vv):
+                    if isinstance(vv, str):
+                        if vv.strip() != "":
+                            only_scalars.append(vv)
+                    else:
+                        only_scalars.append(vv)
+            if len(only_scalars) == 1:
+                return only_scalars[0]
+
+            only_strings = []
+            for vv in inputs.values():
+                if isinstance(vv, str) and vv.strip() != "":
+                    only_strings.append(vv)
+            if len(only_strings) == 1:
+                return only_strings[0]
+
+            for key in ("value", "text", "string", "prompt", "input"):
+                vv = inputs.get(key)
+                if isinstance(vv, list) and len(vv) == 2:
+                    got = _resolve(vv, depth - 1, seen)
+                    if got is not None:
+                        return got
+            link_values = []
+            for vv in inputs.values():
+                if isinstance(vv, list) and len(vv) == 2:
+                    link_values.append(vv)
+            if len(link_values) == 1:
+                got = _resolve(link_values[0], depth - 1, seen)
+                if got is not None:
+                    return got
+
+        wv = src.get("widgets_values")
+        if isinstance(wv, list):
+            only_scalars = []
+            for x in wv:
+                if _bitable_error_monitor_is_plain_value(x):
+                    if isinstance(x, str):
+                        if x.strip() != "":
+                            only_scalars.append(x)
+                    else:
+                        only_scalars.append(x)
+            if len(only_scalars) == 1:
+                return only_scalars[0]
+            only_strings = [x for x in wv if isinstance(x, str) and x.strip() != ""]
+            if len(only_strings) == 1:
+                return only_strings[0]
+
+        return None
+
+    return _resolve(val, 10, set())
+
+def _bitable_error_monitor_try_autoconfig_from_prompt(prompt):
+    global _BITABLE_ERROR_MONITOR_AUTOCONFIGURED, _BITABLE_ERROR_MONITOR_CONFIG, _BITABLE_ERROR_MONITOR_ENABLED, _BITABLE_ERROR_MONITOR_COOLDOWN_SECONDS, _BITABLE_ERROR_MONITOR_MAX_CHARS, _BITABLE_ERROR_MONITOR_PUSH_DETAILS, _BITABLE_ERROR_MONITOR_LAST_CONFIG_SRC_ID, _BITABLE_ERROR_MONITOR_LAST_MONITOR_NODE_ID, _BITABLE_ERROR_MONITOR_LAST_CONFIG_NODE_ID
+    if not isinstance(prompt, dict):
+        return
+    _bitable_error_monitor_set_last_prompt(prompt)
+
+    mon_node_id = None
+    mon_node = None
+    mon_config_src_id = None
+    mon_enabled = None
+    mon_push_details = None
+    mon_cooldown = None
+    mon_max_chars = None
+
+    for nid, nobj in prompt.items():
+        if not isinstance(nobj, dict):
+            continue
+        ct = nobj.get("class_type")
+        if ct not in ("FeishuBitableErrorMonitorNode", "FeishuBitableErrorMonitorNode.Comfy"):
+            continue
+
+        ev = _bitable_error_monitor_prompt_get_input_any(prompt, nobj, "enabled")
+        pv = _bitable_error_monitor_prompt_get_input_any(prompt, nobj, "push_error_details")
+        cv = _bitable_error_monitor_prompt_get_input_any(prompt, nobj, "cooldown_seconds")
+        mv = _bitable_error_monitor_prompt_get_input_any(prompt, nobj, "max_chars")
+        src = None
+        if isinstance(nobj.get("inputs"), dict):
+            src = _bitable_error_monitor_get_link_src(nobj.get("inputs", {}).get("config"))
+
+        if mon_node is None:
+            mon_node_id = nid
+            mon_node = nobj
+            mon_config_src_id = src
+            if isinstance(ev, bool):
+                mon_enabled = ev
+            if isinstance(pv, bool):
+                mon_push_details = pv
+            if isinstance(cv, (int, float, str)):
+                try:
+                    mon_cooldown = int(cv)
+                except Exception:
+                    mon_cooldown = None
+            if isinstance(mv, (int, float, str)):
+                try:
+                    mon_max_chars = int(mv)
+                except Exception:
+                    mon_max_chars = None
+
+        if isinstance(ev, bool) and ev is True:
+            mon_node_id = nid
+            mon_node = nobj
+            mon_config_src_id = src
+            mon_enabled = ev
+            if isinstance(pv, bool):
+                mon_push_details = pv
+            if isinstance(cv, (int, float, str)):
+                try:
+                    mon_cooldown = int(cv)
+                except Exception:
+                    mon_cooldown = None
+            if isinstance(mv, (int, float, str)):
+                try:
+                    mon_max_chars = int(mv)
+                except Exception:
+                    mon_max_chars = None
+            break
+
+    if not mon_node:
+        return
+
+    cfg_node_id = None
+    cfg_node = None
+    if mon_config_src_id is not None:
+        chain_ids = _bitable_error_monitor_collect_pre_config_chain(prompt, mon_config_src_id)
+        for cid in reversed(chain_ids):
+            cobj = prompt.get(cid) or prompt.get(str(cid))
+            if isinstance(cobj, dict) and cobj.get("class_type") in ("FeishuBitableConfigNode", "FeishuBitableConfigNode.Comfy"):
+                cfg_node_id = cid
+                cfg_node = cobj
+                break
+
+    if cfg_node is None:
+        for nid, nobj in prompt.items():
+            if isinstance(nobj, dict) and nobj.get("class_type") in ("FeishuBitableConfigNode", "FeishuBitableConfigNode.Comfy"):
+                cfg_node_id = nid
+                cfg_node = nobj
+                break
+    if cfg_node is None:
+        return
+
+    app_token = str(_bitable_error_monitor_prompt_get_input_any(prompt, cfg_node, "app_token") or "").strip()
+    table_id = str(_bitable_error_monitor_prompt_get_input_any(prompt, cfg_node, "table_id") or "").strip()
+    view_id = str(_bitable_error_monitor_prompt_get_input_any(prompt, cfg_node, "view_id") or "").strip()
+    app_id = str(_bitable_error_monitor_prompt_get_input_any(prompt, cfg_node, "feishu_app_id") or "").strip()
+    app_secret = str(_bitable_error_monitor_prompt_get_input_any(prompt, cfg_node, "feishu_app_secret") or "").strip()
+    if not (app_token and table_id and app_id and app_secret):
+        return
+
+    chain_item = {}
+    if mon_config_src_id is not None:
+        chain_item = _bitable_error_monitor_extract_chain_item(prompt, mon_config_src_id)
+    fields = chain_item.get("fields") if isinstance(chain_item, dict) else None
+    field_types = chain_item.get("field_types") if isinstance(chain_item, dict) else None
+    record_action = chain_item.get("record_action") if isinstance(chain_item, dict) else None
+    record_index = chain_item.get("record_index") if isinstance(chain_item, dict) else None
+    record_id = chain_item.get("record_id") if isinstance(chain_item, dict) else None
+    match_field = chain_item.get("match_field") if isinstance(chain_item, dict) else None
+    match_value = chain_item.get("match_value") if isinstance(chain_item, dict) else None
+    if not isinstance(fields, dict):
+        fields = {}
+    if not isinstance(field_types, dict):
+        field_types = {}
+    if not isinstance(record_action, str) or not record_action.strip():
+        record_action = "append"
+    try:
+        record_index = int(record_index or 0)
+    except Exception:
+        record_index = 0
+    record_id = str(record_id or "").strip()
+    match_field = str(match_field or "").strip()
+
+    item = {
+        "app_token": app_token,
+        "table_id": table_id,
+        "view_id": view_id,
+        "fields": fields,
+        "field_types": field_types,
+        "record_action": record_action,
+        "record_index": record_index,
+        "record_id": record_id,
+        "match_field": match_field,
+        "match_value": match_value,
+    }
+    config = {
+        "bitable_app_token": app_token,
+        "bitable_table_id": table_id,
+        "bitable_view_id": view_id,
+        "feishu_app_id": app_id,
+        "feishu_app_secret": app_secret,
+        "bitable_items": [item],
+    }
+
+    with _BITABLE_ERROR_MONITOR_LOCK:
+        _BITABLE_ERROR_MONITOR_CONFIG = config
+        _BITABLE_ERROR_MONITOR_AUTOCONFIGURED = True
+        if mon_config_src_id is not None:
+            _BITABLE_ERROR_MONITOR_LAST_CONFIG_SRC_ID = mon_config_src_id
+        if mon_node_id is not None:
+            _BITABLE_ERROR_MONITOR_LAST_MONITOR_NODE_ID = mon_node_id
+        if cfg_node_id is not None:
+            _BITABLE_ERROR_MONITOR_LAST_CONFIG_NODE_ID = cfg_node_id
+        if mon_enabled is not None:
+            _BITABLE_ERROR_MONITOR_ENABLED = bool(mon_enabled)
+        if mon_push_details is not None:
+            _BITABLE_ERROR_MONITOR_PUSH_DETAILS = bool(mon_push_details)
+        if isinstance(mon_cooldown, int) and mon_cooldown >= 0:
+            _BITABLE_ERROR_MONITOR_COOLDOWN_SECONDS = mon_cooldown
+        if isinstance(mon_max_chars, int):
+            if mon_max_chars <= 0:
+                pass
+            elif mon_max_chars > 20000:
+                _BITABLE_ERROR_MONITOR_MAX_CHARS = 20000
+            else:
+                _BITABLE_ERROR_MONITOR_MAX_CHARS = mon_max_chars
+
+def _bitable_error_monitor_install_prompt_handler():
+    global _BITABLE_ERROR_MONITOR_PROMPT_HANDLER_INSTALLED
+    if _BITABLE_ERROR_MONITOR_PROMPT_HANDLER_INSTALLED:
+        return
+    try:
+        from server import PromptServer
+        ps = getattr(PromptServer, "instance", None)
+        if ps is None:
+            return
+        def _on_prompt(json_data):
+            try:
+                if isinstance(json_data, dict):
+                    p = json_data.get("prompt")
+                    if isinstance(p, dict):
+                        _bitable_error_monitor_try_autoconfig_from_prompt(p)
+                        _bitable_error_monitor_set_last_prompt(p)
+                        _bitable_error_monitor_debug("on_prompt", f"received prompt nodes={len(p)} keys_sample={list(p.keys())[:3]}")
+            except Exception:
+                pass
+            return json_data
+        ps.add_on_prompt_handler(_on_prompt)
+        _BITABLE_ERROR_MONITOR_PROMPT_HANDLER_INSTALLED = True
+        _bitable_error_monitor_debug("patch", "installed PromptServer.on_prompt handler")
+    except Exception:
+        return
+
+def _bitable_error_monitor_start_prompt_handler_retry():
+    global _BITABLE_ERROR_MONITOR_PROMPT_HANDLER_RETRY_STARTED
+    if _BITABLE_ERROR_MONITOR_PROMPT_HANDLER_RETRY_STARTED:
+        return
+    _BITABLE_ERROR_MONITOR_PROMPT_HANDLER_RETRY_STARTED = True
+
+    def _worker():
+        while True:
+            try:
+                if _BITABLE_ERROR_MONITOR_PROMPT_HANDLER_INSTALLED:
+                    return
+                _bitable_error_monitor_install_prompt_handler()
+                if _BITABLE_ERROR_MONITOR_PROMPT_HANDLER_INSTALLED:
+                    return
+            except Exception:
+                pass
+            try:
+                time.sleep(0.5)
+            except Exception:
+                return
+
+    try:
+        t = threading.Thread(target=_worker, name="AnySwitch_BitablePromptHook", daemon=True)
+        t.start()
+    except Exception:
+        return
+
+def _bitable_error_monitor_on_flush(entries):
+    try:
+        msgs = []
+        for e in entries or []:
+            if isinstance(e, dict) and "m" in e:
+                msgs.append(e.get("m") or "")
+        chunk = "".join(msgs)
+        if not chunk:
+            return
+        _bitable_error_monitor_enqueue(datetime.now().strftime("%Y-%m-%d %H:%M:%S"), chunk, force=False)
+    except Exception:
+        return
+
+def _bitable_error_monitor_worker():
+    global _BITABLE_ERROR_MONITOR_LAST_SENT_TS, _BITABLE_ERROR_MONITOR_SENDING
+    while True:
+        _BITABLE_ERROR_MONITOR_EVENT.wait()
+        _BITABLE_ERROR_MONITOR_EVENT.clear()
+        payload = None
+        with _BITABLE_ERROR_MONITOR_LOCK:
+            if not _BITABLE_ERROR_MONITOR_ENABLED:
+                continue
+            if _BITABLE_ERROR_MONITOR_QUEUE:
+                payload = _BITABLE_ERROR_MONITOR_QUEUE.pop(0)
+        if not payload:
+            continue
+
+        now = time.time()
+        with _BITABLE_ERROR_MONITOR_LOCK:
+            cd = int(_BITABLE_ERROR_MONITOR_COOLDOWN_SECONDS or 0)
+            if cd > 0 and (now - _BITABLE_ERROR_MONITOR_LAST_SENT_TS) < cd:
+                continue
+            _BITABLE_ERROR_MONITOR_LAST_SENT_TS = now
+            _BITABLE_ERROR_MONITOR_SENDING = True
+            cfg = _BITABLE_ERROR_MONITOR_CONFIG.copy() if isinstance(_BITABLE_ERROR_MONITOR_CONFIG, dict) else None
+
+        try:
+            if not cfg:
+                continue
+            target = _bitable_error_monitor_pick_target(cfg)
+            if not target:
+                continue
+            _bitable_error_monitor_debug("worker", f"payload_kind={payload.get('kind','log')} enabled={_BITABLE_ERROR_MONITOR_ENABLED} push_details={_BITABLE_ERROR_MONITOR_PUSH_DETAILS}")
+            app_id = (cfg.get("feishu_app_id") or "").strip()
+            app_secret = (cfg.get("feishu_app_secret") or "").strip()
+            if not (app_id and app_secret):
+                continue
+
+            client = FeishuBitableClient(app_id, app_secret)
+            app_token = client.resolve_app_token(target.get("app_token") or "", target.get("table_id") or "")
+            table_id = (target.get("table_id") or "").strip()
+            view_id = (target.get("view_id") or "").strip() or None
+
+            if payload.get("kind") == "execution_error":
+                et = str(payload.get("exception_type") or "")
+                em = str(payload.get("exception_message") or "")
+                tb = _bitable_error_monitor_sanitize_traceback(payload.get("traceback") or "")
+                err_line = f"{et}: {em}".strip(": ").strip()
+                if err_line and set(err_line.strip()) <= {"^"}:
+                    err_line = ""
+                ctx = {
+                    "time": payload.get("time") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "error": err_line or em or et,
+                    "traceback": (err_line + "\n" + tb).strip() if tb else (err_line or ""),
+                }
+            else:
+                text = payload.get("text") or ""
+                text = _bitable_error_monitor_sanitize_traceback(text)
+                summary = _bitable_error_monitor_extract_summary(text)
+                ctx = {
+                    "time": payload.get("time") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "error": summary,
+                    "traceback": text,
+                }
+            extra_fields = _bitable_error_monitor_coerce_fields(target.get("fields"), ctx) if isinstance(target, dict) else {}
+            prompt_snapshot = None
+            config_src_id = None
+            with _BITABLE_ERROR_MONITOR_LOCK:
+                if isinstance(_BITABLE_ERROR_MONITOR_LAST_PROMPT, dict):
+                    prompt_snapshot = _BITABLE_ERROR_MONITOR_LAST_PROMPT
+                config_src_id = _BITABLE_ERROR_MONITOR_LAST_CONFIG_SRC_ID
+
+            _bitable_error_monitor_debug("worker", f"have_prompt={'yes' if isinstance(prompt_snapshot, dict) else 'no'} config_src_id_cached={config_src_id}")
+
+            if isinstance(prompt_snapshot, dict):
+                mon = _bitable_error_monitor_find_monitor_from_prompt(prompt_snapshot)
+                if mon is not None:
+                    mn = mon[1]
+                    if isinstance(mn, dict) and isinstance(mn.get("inputs"), dict):
+                        found_src = _bitable_error_monitor_get_link_src(mn.get("inputs", {}).get("config"))
+                        if found_src is not None:
+                            config_src_id = found_src
+                            _bitable_error_monitor_debug("worker", f"config_src_id_from_monitor={config_src_id}")
+
+            if (config_src_id is None) and isinstance(prompt_snapshot, dict):
+                mon_id = None
+                with _BITABLE_ERROR_MONITOR_LOCK:
+                    mon_id = _BITABLE_ERROR_MONITOR_LAST_MONITOR_NODE_ID
+                if mon_id is not None:
+                    mn = prompt_snapshot.get(mon_id) or prompt_snapshot.get(str(mon_id))
+                    if isinstance(mn, dict) and isinstance(mn.get("inputs"), dict):
+                        config_src_id = _bitable_error_monitor_get_link_src(mn.get("inputs", {}).get("config"))
+                if config_src_id is None:
+                    for nid, nobj in prompt_snapshot.items():
+                        if not isinstance(nobj, dict):
+                            continue
+                        if nobj.get("class_type") not in ("FeishuBitableErrorMonitorNode", "FeishuBitableErrorMonitorNode.Comfy"):
+                            continue
+                        ev = _bitable_error_monitor_prompt_get_input_any(prompt_snapshot, nobj, "enabled")
+                        if isinstance(ev, bool) and (not ev):
+                            continue
+                        if isinstance(nobj.get("inputs"), dict):
+                            config_src_id = _bitable_error_monitor_get_link_src(nobj.get("inputs", {}).get("config"))
+                            if config_src_id is not None:
+                                break
+
+            chain_item = {}
+            if prompt_snapshot and (config_src_id is not None):
+                chain_item = _bitable_error_monitor_extract_chain_item(prompt_snapshot, config_src_id)
+            if _BITABLE_ERROR_MONITOR_DEBUG and isinstance(prompt_snapshot, dict) and (config_src_id is not None):
+                try:
+                    chain_ids_dbg = _bitable_error_monitor_collect_pre_config_chain(prompt_snapshot, config_src_id)
+                    chain_types_dbg = []
+                    for cid in chain_ids_dbg:
+                        obj = prompt_snapshot.get(cid) or prompt_snapshot.get(str(cid))
+                        chain_types_dbg.append(str(obj.get("class_type") if isinstance(obj, dict) else ""))
+                    _bitable_error_monitor_debug("chain", f"chain_ids={chain_ids_dbg} chain_types={chain_types_dbg}")
+                except Exception:
+                    pass
+
+            prompt_fields = {}
+            prompt_types = {}
+            chain_record_action = None
+            chain_record_index = None
+            chain_record_id = None
+            chain_match_field = None
+            chain_match_value = None
+            if isinstance(chain_item, dict) and chain_item:
+                prompt_fields = chain_item.get("fields") or {}
+                prompt_types = chain_item.get("field_types") or {}
+                chain_record_action = chain_item.get("record_action")
+                chain_record_index = chain_item.get("record_index")
+                chain_record_id = chain_item.get("record_id")
+                chain_match_field = chain_item.get("match_field")
+                chain_match_value = chain_item.get("match_value")
+            elif prompt_snapshot:
+                prompt_fields, prompt_types = _bitable_error_monitor_extract_custom_fields_from_prompt(prompt_snapshot)
+
+            if isinstance(prompt_fields, dict) and prompt_fields:
+                prompt_fields = _bitable_error_monitor_coerce_fields(prompt_fields, ctx)
+
+            fields = {}
+            if isinstance(prompt_fields, dict) and prompt_fields:
+                fields.update(prompt_fields)
+            if isinstance(extra_fields, dict) and extra_fields:
+                fields.update(extra_fields)
+            if _BITABLE_ERROR_MONITOR_DEBUG:
+                try:
+                    _bitable_error_monitor_debug("fields", f"prompt_fields_keys={list((prompt_fields or {}).keys())} extra_fields_keys={list((extra_fields or {}).keys())} final_keys={list(fields.keys())}")
+                except Exception:
+                    pass
+            if _BITABLE_ERROR_MONITOR_PUSH_DETAILS:
+                fields.update({"错误": ctx["error"], "错误时间": ctx["time"], "堆栈": ctx["traceback"]})
+                if not fields:
+                    fields = {"错误时间": ctx["time"]}
+            else:
+                if not fields:
+                    continue
+
+            existing_field_info = {}
+            try:
+                existing_field_info = client.list_fields_info(app_token, table_id) or {}
+            except Exception:
+                existing_field_info = {}
+
+            required = []
+            merged_types = {}
+            if isinstance(prompt_types, dict) and prompt_types:
+                merged_types.update(prompt_types)
+            tmap = target.get("field_types") if isinstance(target, dict) else None
+            if isinstance(tmap, dict) and tmap:
+                merged_types.update(tmap)
+
+            dropped = []
+            if isinstance(existing_field_info, dict) and existing_field_info:
+                for k in list(fields.keys()):
+                    kk = str(k).strip()
+                    if not kk:
+                        fields.pop(k, None)
+                        continue
+                    if kk not in existing_field_info:
+                        continue
+                    try:
+                        v = fields.get(k)
+                        tt = (merged_types.get(kk) or "").strip() if isinstance(merged_types, dict) else ""
+                        expected_ui = tt or _bitable_error_monitor_guess_type(v)
+                        expected_map = client._map_field_type(expected_ui) if expected_ui else {}
+                        expected_type = expected_map.get("type") if isinstance(expected_map, dict) else None
+                        actual_type = existing_field_info.get(kk, {}).get("type") if isinstance(existing_field_info.get(kk), dict) else None
+                        if (expected_type is not None) and (actual_type is not None) and (int(expected_type) != int(actual_type)):
+                            actual_ui = str(existing_field_info.get(kk, {}).get("ui_type") or actual_type)
+                            dropped.append(f"{kk}({expected_ui}->{actual_ui})")
+                            fields.pop(k, None)
+                    except Exception:
+                        continue
+
+            if dropped and _BITABLE_ERROR_MONITOR_PUSH_DETAILS:
+                try:
+                    tail = "字段类型不匹配已跳过: " + " | ".join(dropped)
+                    if isinstance(ctx.get("error"), str) and ctx["error"].strip():
+                        ctx["error"] = ctx["error"].strip() + " | " + tail
+                    else:
+                        ctx["error"] = tail
+                    if "错误" in fields:
+                        fields["错误"] = ctx["error"]
+                except Exception:
+                    pass
+
+            for k, v in fields.items():
+                kk = str(k).strip()
+                if not kk:
+                    continue
+                tt = (merged_types.get(kk) or "").strip() if isinstance(merged_types, dict) else ""
+                required.append({"name": kk, "type": tt or _bitable_error_monitor_guess_type(v)})
+            try:
+                client.ensure_fields(app_token, table_id, required)
+            except Exception:
+                pass
+
+            record_action = (target.get("record_action") or "append").strip()
+            record_id_val = (target.get("record_id") or "").strip()
+            match_field = (target.get("match_field") or "").strip()
+            match_value = target.get("match_value")
+            record_idx = 0
+            try:
+                record_idx = int(target.get("record_index") or 0)
+            except Exception:
+                record_idx = 0
+
+            if isinstance(chain_record_action, str) and chain_record_action.strip():
+                record_action = chain_record_action.strip()
+            if isinstance(chain_record_id, str) and chain_record_id.strip():
+                record_id_val = chain_record_id.strip()
+            if isinstance(chain_match_field, str) and chain_match_field.strip():
+                match_field = chain_match_field.strip()
+                match_value = chain_match_value
+            if chain_record_index is not None:
+                try:
+                    record_idx = int(chain_record_index or 0)
+                except Exception:
+                    pass
+
+            target_record_id = None
+            should_update = False
+
+            if record_action == "update_index" and record_idx > 0:
+                curr_idx = 0
+                pg_token = None
+                while True:
+                    recs = client.list_records(app_token, table_id, view_id, 100, pg_token)
+                    if not recs or not recs.get("items"):
+                        break
+                    items_list = recs.get("items", [])
+                    if curr_idx + len(items_list) >= record_idx:
+                        offset = record_idx - curr_idx - 1
+                        if 0 <= offset < len(items_list):
+                            target_record_id = items_list[offset].get("record_id")
+                        break
+                    curr_idx += len(items_list)
+                    if not recs.get("has_more"):
+                        break
+                    pg_token = recs.get("page_token")
+                if target_record_id:
+                    should_update = True
+            elif record_action == "update_id" and record_id_val:
+                target_record_id = record_id_val
+                should_update = True
+            elif record_action == "update_match" and match_field:
+                safe_val = str(match_value or "").replace('"', '\\"')
+                filter_str = f'CurrentValue.[{match_field}] = "{safe_val}"'
+                recs = client.list_records(app_token, table_id, view_id, 20, None, filter=filter_str)
+                if recs and recs.get("items"):
+                    target_record_id = recs.get("items")[0].get("record_id")
+                    should_update = True
+
+            if should_update and target_record_id:
+                sc, st = client.update_record(app_token, table_id, target_record_id, fields)
+                if sc not in (200, 201):
+                    print(f"[FeishuBitable][ErrorMonitor] Update failed: {sc} {str(st)[:200]}")
+            else:
+                sc, st = client.create_record(app_token, table_id, fields, view_id)
+                if sc not in (200, 201):
+                    print(f"[FeishuBitable][ErrorMonitor] Create failed: {sc} {str(st)[:200]}")
+        except Exception:
+            try:
+                traceback.print_exc()
+            except Exception:
+                pass
+        finally:
+            with _BITABLE_ERROR_MONITOR_LOCK:
+                _BITABLE_ERROR_MONITOR_SENDING = False
+
+class FeishuBitableErrorMonitorNode:
+    CATEGORY = "maoyu/多维表格"
+    OUTPUT_NODE = True
+    TITLE = "飞书表格错误监控 (Bitable Error Monitor)"
+    class Comfy(io.ComfyNode):
+        @classmethod
+        def define_schema(cls):
+            return io.Schema(
+                node_id="FeishuBitableErrorMonitorNode",
+                display_name="Feishu Bitable 错误监控（全局）",
+                category="maoyu/多维表格",
+                is_output_node=True,
+                inputs=[
+                    io.Custom("MESSAGE_CONFIG").Input("config"),
+                    io.Boolean.Input("enabled", default=True, tooltip="开启后，ComfyUI 出现错误日志会自动写入多维表格"),
+                    io.Boolean.Input("push_error_details", default=True, tooltip="是否写入错误详情（错误/时间/堆栈）"),
+                    io.Int.Input("cooldown_seconds", default=3, tooltip="同一时间段内最多写入一次，避免刷屏"),
+                    io.Int.Input("max_chars", default=6000, tooltip="最多截取多少字符写入（过长会被截断）"),
+                ],
+                outputs=[io.String.Output(display_name="日志")],
+            )
+        @classmethod
+        def execute(cls, config, enabled: bool, push_error_details: bool, cooldown_seconds: int, max_chars: int) -> io.NodeOutput:
+            global _BITABLE_ERROR_MONITOR_ENABLED, _BITABLE_ERROR_MONITOR_STARTED, _BITABLE_ERROR_MONITOR_COOLDOWN_SECONDS, _BITABLE_ERROR_MONITOR_CONFIG, _BITABLE_ERROR_MONITOR_MAX_CHARS, _BITABLE_ERROR_MONITOR_PUSH_DETAILS
+
+            if not isinstance(config, dict):
+                raise ValueError("错误监控：config 必须连接 Feishu Bitable 配置节点输出。")
+
+            try:
+                _bitable_error_monitor_try_autoconfig_from_prompt(config.get("prompt"))
+            except Exception:
+                pass
+
+            cd = int(cooldown_seconds or 0)
+            if cd < 0:
+                cd = 0
+            mc = int(max_chars or 0)
+            if mc <= 0:
+                mc = 6000
+            if mc > 20000:
+                mc = 20000
+
+            with _BITABLE_ERROR_MONITOR_LOCK:
+                _BITABLE_ERROR_MONITOR_CONFIG = config.copy()
+                _BITABLE_ERROR_MONITOR_COOLDOWN_SECONDS = cd
+                _BITABLE_ERROR_MONITOR_MAX_CHARS = mc
+                _BITABLE_ERROR_MONITOR_ENABLED = bool(enabled)
+                _BITABLE_ERROR_MONITOR_PUSH_DETAILS = bool(push_error_details)
+
+                if not _BITABLE_ERROR_MONITOR_STARTED:
+                    try:
+                        import app.logger as comfy_app_logger
+                        comfy_app_logger.on_flush(_bitable_error_monitor_on_flush)
+                    except Exception:
+                        traceback.print_exc()
+                    try:
+                        _bitable_error_monitor_patch_execution()
+                    except Exception:
+                        traceback.print_exc()
+                    try:
+                        _bitable_error_monitor_patch_excepthook()
+                    except Exception:
+                        traceback.print_exc()
+                    t = threading.Thread(target=_bitable_error_monitor_worker, name="AnySwitch_BitableErrorMonitor", daemon=True)
+                    t.start()
+                    _BITABLE_ERROR_MONITOR_STARTED = True
+
+            status = "启用" if enabled else "关闭"
+            details = "开启" if push_error_details else "关闭"
+            return io.NodeOutput(f"错误监控已{status}，错误详情={details}，cooldown={cd}s max_chars={mc}")
 
 NODE_CLASS_MAPPINGS = {
     "FeishuBitablePushNode": FeishuBitablePushNode.Comfy,
@@ -1841,7 +3428,8 @@ NODE_CLASS_MAPPINGS = {
     "FeishuBitableUpdateRowNode": FeishuBitableUpdateRowNode.Comfy,
     "FeishuBitableUpdateIDNode": FeishuBitableUpdateIDNode.Comfy,
     "FeishuBitableMatchNode": FeishuBitableMatchNode.Comfy,
-    "FeishuBitableFieldNode": FeishuBitableFieldNode.Comfy
+    "FeishuBitableFieldNode": FeishuBitableFieldNode.Comfy,
+    "FeishuBitableErrorMonitorNode": FeishuBitableErrorMonitorNode.Comfy
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1850,7 +3438,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FeishuBitableUpdateRowNode": "Feishu Bitable 更新行",
     "FeishuBitableUpdateIDNode": "Feishu Bitable 更新ID",
     "FeishuBitableMatchNode": "Feishu Bitable 匹配更新",
-    "FeishuBitableFieldNode": "Feishu Bitable 字段"
+    "FeishuBitableFieldNode": "Feishu Bitable 字段",
+    "FeishuBitableErrorMonitorNode": "Feishu Bitable 错误监控（全局）"
 }
 
 def _self_test(config):
@@ -1892,6 +3481,11 @@ def _self_test(config):
     print(f"[FeishuBitable][SelfTest] Case2 payload_count={len(payload2)}")
     s2, t2 = client.create_record(app_token, table_id, payload2, view_id if view_id else None)
     print(f"[FeishuBitable][SelfTest] Case2 http={s2} body={str(t2)[:200]}")
+
+try:
+    _bitable_error_monitor_bootstrap()
+except Exception:
+    pass
 
 if __name__ == "__main__":
     import os
