@@ -7,6 +7,7 @@ import os
 import hashlib
 import uuid
 import traceback
+import json
 
 def _get_machine_guid() -> str:
     try:
@@ -172,6 +173,97 @@ def _safe_load_protected(module_name: str):
 
 _bitable_query_nodes, _bitable_query_display_names = _safe_load_protected("feishu_bitable_query_tools")
 _bitable_write_nodes, _bitable_write_display_names = _safe_load_protected("feishu_bitable_write_batch")
+
+def _patch_force_query_behavior():
+    cls = None
+    try:
+        cls = (_bitable_query_nodes or {}).get("FeishuBitableQueryRecordsNode")
+    except Exception:
+        cls = None
+    if cls is None:
+        return
+    if getattr(cls, "_anyswitch_force_query_patched", False):
+        return
+    cls._anyswitch_force_query_patched = True
+
+    def _stable_fingerprint(v):
+        if v is None or isinstance(v, (str, int, float, bool)):
+            return v
+        try:
+            return json.dumps(v, ensure_ascii=False, sort_keys=True, default=str)
+        except Exception:
+            try:
+                return str(v)
+            except Exception:
+                return repr(v)
+
+    @classmethod
+    def IS_CHANGED(c, *args, **kwargs):
+        if bool(kwargs.get("force_query", False)):
+            import time
+            return time.time_ns()
+        try:
+            payload = {k: _stable_fingerprint(v) for k, v in (kwargs or {}).items()}
+            raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8", errors="ignore")
+            return hashlib.sha256(raw).hexdigest()
+        except Exception:
+            return None
+
+    cls.IS_CHANGED = IS_CHANGED
+
+    if hasattr(cls, "fingerprint_inputs"):
+        old_fingerprint_inputs = cls.fingerprint_inputs
+
+        @classmethod
+        def fingerprint_inputs(c, *args, **kwargs):
+            if bool(kwargs.get("force_query", False)):
+                import time
+                return time.time_ns()
+            return old_fingerprint_inputs(*args, **kwargs)
+
+        cls.fingerprint_inputs = fingerprint_inputs
+
+    if hasattr(cls, "execute"):
+        try:
+            from comfy_api.latest import io as _io_anyswitch
+        except Exception:
+            _io_anyswitch = None
+
+        old_execute = cls.execute
+
+        @classmethod
+        def execute(c, *args, **kwargs):
+            import time
+            run_id = int(time.time_ns())
+            out = old_execute(*args, **kwargs)
+            if _io_anyswitch is None:
+                return out
+            try:
+                if isinstance(out, _io_anyswitch.NodeOutput):
+                    args2 = list(out.args or ())
+                    if len(args2) >= 5:
+                        try:
+                            args2[4] = f"run_id={run_id} | {str(args2[4] or '')}"
+                        except Exception:
+                            pass
+                    return _io_anyswitch.NodeOutput(*args2, ui=out.ui, expand=out.expand, block_execution=getattr(out, "block_execution", None))
+                if isinstance(out, dict) and "result" in out:
+                    res = out.get("result")
+                    if isinstance(res, (list, tuple)) and len(res) >= 5:
+                        res = list(res)
+                        try:
+                            res[4] = f"run_id={run_id} | {str(res[4] or '')}"
+                        except Exception:
+                            pass
+                        out["result"] = tuple(res)
+                    return out
+            except Exception:
+                return out
+            return out
+
+        cls.execute = execute
+
+_patch_force_query_behavior()
 
 # === 汇总所有节点 ===
 NODE_CLASS_MAPPINGS = {}
